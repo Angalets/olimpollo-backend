@@ -509,60 +509,55 @@ app.post('/api/inventario/guardar', async (req, res) => {
 // ENDPOINTS DE PEDIDOS (TABLAS PEDIDOS y PEDIDO_ITEMS)
 // ======================================================================
 
+// server.js (Reemplazar este endpoint GET /api/pedidos)
+
 app.get('/api/pedidos', async (req, res) => {
-    // server.js (Añadir al inicio de app.get('/api/pedidos'))
-// Bloque que marca pedidos como entregados si tienen más de 1 hora y estado 'Pendiente'
-await pool.query(`
-    UPDATE Pedidos
-    SET estado = 'Entregado' -- O 'Vencido' o 'Cerrado'
-    WHERE estado = 'Pendiente' 
-    AND fecha_creacion < NOW() - INTERVAL '1 hour';
-`);
-// Luego continúa con la consulta SELECT normal...
-    const { canal } = req.query; // Captura el parámetro de filtro: ?canal=Uber
-    
-    let whereClause = '';
+    // 1. Marcar pedidos viejos como entregados (si aplica)
+    await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '1 hour';`);
+
+    // 2. Capturar filtros de canal Y ESTADO
+    const { canal, estado } = req.query; 
+    let whereClauses = [];
     let values = [];
-    
+    let paramIndex = 1;
+
     if (canal && canal !== 'Todos') {
-        whereClause = 'WHERE p.canal_venta = $1';
+        whereClauses.push(`p.canal_venta = $${paramIndex++}`);
         values.push(canal);
     }
+    // 🚨 NUEVO: Filtrar por estado si se proporciona
+    if (estado) {
+        whereClauses.push(`p.estado = $${paramIndex++}`);
+        values.push(estado);
+    }
+    
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     
     try {
         const query = `
             SELECT 
-                p.id, 
-                p.cliente, 
-                p.estado, 
-                CAST(p.total AS TEXT) AS total, 
-                p.fecha_creacion,
-                p.canal_venta,
+                p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, 
+                p.fecha_creacion, p.canal_venta,
                 json_agg(json_build_object(
-                    'nombre', pi.nombre_producto,
-                    'cantidad', pi.cantidad,
-                    'precio', CAST(pi.precio_unitario AS TEXT)
-                )) AS items
-            FROM Pedidos p
-            JOIN Pedido_Items pi ON p.id = pi.pedido_id
-            ${whereClause} -- Aplica el filtro
-            GROUP BY p.id, p.cliente, p.estado, p.total, p.fecha_creacion, p.canal_venta
-            ORDER BY p.fecha_creacion DESC;
+                    'nombre_producto', pi.nombre_producto, 
+                    'cantidad', pi.cantidad, 
+                    'precio_unitario', CAST(pi.precio_unitario AS TEXT)
+                )) AS items 
+            FROM pedidos p 
+            JOIN pedido_items pi ON p.id = pi.pedido_id 
+            ${whereClause} 
+            GROUP BY p.id 
+            ORDER BY p.fecha_creacion ASC; -- Ordenar los más antiguos primero para la cocina
         `;
-        const result = await pool.query(query, values); // Pasa el valor del filtro
-
-        const pedidos = result.rows.map(pedido => ({
-            ...pedido,
-            total: parseFloat(pedido.total),
-            items: pedido.items.map(item => ({
-                ...item,
-                precio: parseFloat(item.precio)
-            }))
+        const result = await pool.query(query, values);
+        const pedidos = result.rows.map(p => ({ 
+            ...p, 
+            total: parseFloat(p.total), 
+            items: p.items.map(i => ({ ...i, precio_unitario: parseFloat(i.precio_unitario) })) 
         }));
-
         res.status(200).json(pedidos);
     } catch (err) {
-        console.error('Error al obtener pedidos con filtro:', err);
+        console.error('Error al obtener pedidos con filtros:', err);
         res.status(500).json({ error: 'Error del servidor al obtener los pedidos.' });
     }
 });
