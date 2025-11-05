@@ -28,6 +28,15 @@ const pool = new Pool({
     ssl: isProduction ? { rejectUnauthorized: false } : false
 });
 
+pool.query('SELECT NOW()', (err, res) => {
+    if (err) {
+        console.error('Error al conectar con la base de datos:', err);
+    } else {
+        console.log('Conexión exitosa a PostgreSQL establecida.');
+    }
+});
+
+
 // ======================================================================
 // MIDDLEWARE (Sin verificación JWT, solo lectura de JSON y CORS)
 // ======================================================================
@@ -59,7 +68,7 @@ app.post('/api/login', async (req, res) => {
         const token = jwt.sign(
             { userId: user.id, username: username, rol: user.rol }, 
             JWT_SECRET, 
-            { expiresIn: '1h' } 
+            { expiresIn: '8h' } 
         );
 
         res.status(200).json({ 
@@ -183,7 +192,6 @@ app.get('/api/menu/pos', async (req, res) => {
 // [GET] /api/menu/productos - Listar todos los productos (Para selector de recetas)
 app.get('/api/menu/productos', async (req, res) => {
     try {
-        // 🚨 CLAVE: Incluimos receta_id para que el Front-End sepa qué producto ya tiene receta
         const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id FROM menu_productos ORDER BY nombre_venta');
         res.status(200).json(result.rows);
     } catch (err) {
@@ -223,7 +231,6 @@ app.put('/api/menu/productos/:id', async (req, res) => {
     }
 
     try {
-        // 🚨 CLAVE: Vincula el producto a la receta (receta_id) o actualiza el resto de los campos.
         const query = `UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6 
                        WHERE id=$7 RETURNING *`;
         const values = [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', id];
@@ -509,14 +516,11 @@ app.post('/api/inventario/guardar', async (req, res) => {
 // ENDPOINTS DE PEDIDOS (TABLAS PEDIDOS y PEDIDO_ITEMS)
 // ======================================================================
 
-// server.js (Reemplazar este endpoint GET /api/pedidos)
-
+// [GET] /api/pedidos - 🚨 MODIFICADO PARA ACEPTAR FILTROS DE FECHA
 app.get('/api/pedidos', async (req, res) => {
-    // 1. Marcar pedidos viejos como entregados (si aplica)
     await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '1 hour';`);
 
-    // 2. Capturar filtros de canal Y ESTADO
-    const { canal, estado } = req.query; 
+    const { canal, estado, fechaInicio, fechaFin } = req.query; 
     let whereClauses = [];
     let values = [];
     let paramIndex = 1;
@@ -525,10 +529,17 @@ app.get('/api/pedidos', async (req, res) => {
         whereClauses.push(`p.canal_venta = $${paramIndex++}`);
         values.push(canal);
     }
-    // 🚨 NUEVO: Filtrar por estado si se proporciona
     if (estado) {
         whereClauses.push(`p.estado = $${paramIndex++}`);
         values.push(estado);
+    }
+    if (fechaInicio) {
+        whereClauses.push(`p.fecha_creacion::date >= $${paramIndex++}`);
+        values.push(fechaInicio);
+    }
+    if (fechaFin) {
+        whereClauses.push(`p.fecha_creacion::date <= $${paramIndex++}`);
+        values.push(fechaFin);
     }
     
     const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
@@ -547,7 +558,7 @@ app.get('/api/pedidos', async (req, res) => {
             JOIN pedido_items pi ON p.id = pi.pedido_id 
             ${whereClause} 
             GROUP BY p.id 
-            ORDER BY p.fecha_creacion ASC; -- Ordenar los más antiguos primero para la cocina
+            ORDER BY p.fecha_creacion DESC; -- Cambiado a DESC para Lista de Pedidos (más nuevos primero)
         `;
         const result = await pool.query(query, values);
         const pedidos = result.rows.map(p => ({ 
@@ -567,7 +578,6 @@ app.delete('/api/pedidos/:id', async (req, res) => {
     const id = parseInt(req.params.id, 10);
 
     try {
-        // La restricción de clave foránea en Pedido_Items debería eliminar los ítems en cascada.
         const result = await pool.query('DELETE FROM Pedidos WHERE id = $1 RETURNING id', [id]);
         
         if (result.rowCount === 0) {
@@ -581,8 +591,7 @@ app.delete('/api/pedidos/:id', async (req, res) => {
     }
 });
 
-// server.js (Reemplazar el endpoint POST de pedidos)
-
+// [POST] /api/pedidos
 app.post('/api/pedidos', async (req, res) => {
     const { cliente, items, canal_venta, total_ajustado } = req.body;
     if (!cliente || !items || items.length === 0) {
@@ -605,7 +614,6 @@ app.post('/api/pedidos', async (req, res) => {
                 INSERT INTO pedido_items 
                     (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario) 
                 VALUES ($1, $2, $3, $4, $5)`;
-            // 🚨 CLAVE: Guardamos el ID y el nombre completo
             const itemValues = [pedidoId, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario];
             await client.query(itemQuery, itemValues);
         }
@@ -622,8 +630,7 @@ app.post('/api/pedidos', async (req, res) => {
 });
 
 
-// server.js (Reemplazar el endpoint PUT de pedidos)
-
+// [PUT] /api/pedidos/:id
 app.put('/api/pedidos/:id', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { estado: nuevoEstado } = req.body;
@@ -638,13 +645,11 @@ app.put('/api/pedidos/:id', async (req, res) => {
         await client.query('BEGIN');
 
         if (nuevoEstado === 'Entregado') {
-            // 🚨 LÓGICA MEJORADA USANDO IDs
             const itemsResult = await client.query(
                 'SELECT menu_producto_id, cantidad FROM "pedido_items" WHERE pedido_id = $1', [id]
             );
             
             for (const item of itemsResult.rows) {
-                // Buscamos la receta usando el ID del producto, no el nombre
                 const recetaResult = await client.query(
                     'SELECT receta_id FROM "menu_productos" WHERE id = $1', [item.menu_producto_id]
                 );
@@ -679,26 +684,8 @@ app.put('/api/pedidos/:id', async (req, res) => {
     }
 });
 
-app.delete('/api/pedidos/:id', async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-
-    try {
-        const result = await pool.query('DELETE FROM Pedidos WHERE id = $1 RETURNING id', [id]);
-        
-        if (result.rowCount === 0) {
-            return res.status(404).json({ error: 'Pedido no encontrado.' });
-        }
-        
-        res.status(204).send(); 
-    } catch (err) {
-        console.error('Error al eliminar pedido:', err);
-        res.status(500).json({ error: 'Error del servidor al eliminar el pedido.' });
-    }
-});
-
 // ======================================================================
 // ENDPOINTS DE RECETAS (TABLAS RECETAS y RECETA_INSUMO)
-// *VERSIÓN FINAL Y FUNCIONAL PARA CREACIÓN/EDICIÓN*
 // ======================================================================
 
 // [GET] /api/recetas - Obtener todas las recetas con sus ingredientes
@@ -888,9 +875,6 @@ app.get('/api/reportes/ventas', async (req, res) => {
 });
 
 // [GET] /api/reportes/inventario - Obtener registros históricos de inventario por fecha
-// server.js (Reemplazar este endpoint completo)
-
-// [GET] /api/reportes/inventario - Obtener registros históricos de inventario por fecha
 app.get('/api/reportes/inventario', async (req, res) => {
     const { fecha } = req.query; 
 
@@ -899,7 +883,6 @@ app.get('/api/reportes/inventario', async (req, res) => {
     }
 
     try {
-        // 🚨 CORRECCIÓN CLAVE: Usamos '::date' para comparar solo la parte de la fecha, ignorando la hora y la zona horaria.
         const query = `
             SELECT 
                 fecha_registro,
@@ -908,7 +891,7 @@ app.get('/api/reportes/inventario', async (req, res) => {
                 unidad_medida,
                 categoria
             FROM Registro_Inventario
-            WHERE fecha_registro::date = $1
+            WHERE fecha_creacion::date = $1
             ORDER BY nombre_insumo;
         `;
         const result = await pool.query(query, [fecha]);
