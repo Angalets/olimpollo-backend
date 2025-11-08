@@ -853,7 +853,7 @@ app.get('/api/reportes/ventas', async (req, res) => {
                 COUNT(id) AS total_pedidos, 
                 SUM(total) AS ventas_totales
             FROM Pedidos
-            WHERE fecha_creacion::date >= $1 AND fecha_creacion::date <= $2
+            WHERE fecha_registro::date = $1 AND fecha_creacion::date <= $2
               AND estado = 'Entregado';
         `;
         const values = [fechaInicio, fechaFin];
