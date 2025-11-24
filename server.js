@@ -630,7 +630,9 @@ app.post('/api/pedidos', async (req, res) => {
 });
 
 
-// [PUT] /api/pedidos/:id
+// ======================================================================
+// ACTUALIZAR PEDIDO Y DESCONTAR INVENTARIO (RECETAS + MODIFICADORES)
+// ======================================================================
 app.put('/api/pedidos/:id', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { estado: nuevoEstado } = req.body;
@@ -644,12 +646,17 @@ app.put('/api/pedidos/:id', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // Solo descontamos inventario si el estado cambia a 'Entregado'
         if (nuevoEstado === 'Entregado') {
+            
+            // 1. Obtener los items del pedido
             const itemsResult = await client.query(
-                'SELECT menu_producto_id, cantidad FROM "pedido_items" WHERE pedido_id = $1', [id]
+                'SELECT menu_producto_id, nombre_producto, cantidad FROM "pedido_items" WHERE pedido_id = $1', [id]
             );
             
             for (const item of itemsResult.rows) {
+                // --- A. DESCUENTO DE LA RECETA BASE ---
+                // Buscamos si el producto principal tiene una receta vinculada
                 const recetaResult = await client.query(
                     'SELECT receta_id FROM "menu_productos" WHERE id = $1', [item.menu_producto_id]
                 );
@@ -668,13 +675,49 @@ app.put('/api/pedidos/:id', async (req, res) => {
                         );
                     }
                 }
+
+                // --- B. DESCUENTO DE MODIFICADORES (OPCIONES) ---
+                // El formato en la DB es: "Nombre Producto (Mod1, Mod2, Mod3)"
+                // Usamos una expresión regular para extraer lo que está dentro de los paréntesis
+                const match = item.nombre_producto.match(/\((.*)\)/);
+                
+                if (match) {
+                    // match[1] contiene "Mod1, Mod2, Mod3"
+                    const modificadoresStr = match[1];
+                    // Separamos por comas y quitamos espacios extra
+                    const modificadoresLista = modificadoresStr.split(',').map(m => m.trim());
+
+                    for (const nombreModificador of modificadoresLista) {
+                        // Buscamos este modificador en la tabla menu_opciones para ver si tiene insumo vinculado
+                        // Usamos 'valor' porque es lo que se guarda en el nombre del producto (ej. "BBQ")
+                        const opcionResult = await client.query(
+                            'SELECT insumo_id, cantidad_insumo FROM menu_opciones WHERE valor = $1 LIMIT 1',
+                            [nombreModificador]
+                        );
+
+                        if (opcionResult.rows.length > 0) {
+                            const { insumo_id, cantidad_insumo } = opcionResult.rows[0];
+                            
+                            // Si tiene un insumo y cantidad configurados (Pasos 1 y 2 completados), descontamos
+                            if (insumo_id && cantidad_insumo) {
+                                const totalModificador = parseFloat(cantidad_insumo) * item.cantidad;
+                                await client.query(
+                                    'UPDATE "insumos" SET cantidad = cantidad - $1 WHERE id = $2',
+                                    [totalModificador, insumo_id]
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         
+        // Actualizar el estado del pedido
         await client.query('UPDATE "pedidos" SET estado = $1 WHERE id = $2', [nuevoEstado, id]);
 
         await client.query('COMMIT');
-        res.status(200).json({ id, estado: nuevoEstado, mensaje: 'Pedido actualizado con éxito.' });
+        res.status(200).json({ id, estado: nuevoEstado, mensaje: 'Pedido actualizado e inventario descontado (Receta + Modificadores).' });
+
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Error al actualizar pedido (ROLLBACK):', err);
