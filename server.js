@@ -630,9 +630,8 @@ app.post('/api/pedidos', async (req, res) => {
 });
 
 
-// ======================================================================
-// ACTUALIZAR PEDIDO Y DESCONTAR INVENTARIO (RECETAS + MODIFICADORES)
-// ======================================================================
+// server.js - Reemplazar endpoint PUT /api/pedidos/:id
+
 app.put('/api/pedidos/:id', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { estado: nuevoEstado } = req.body;
@@ -649,47 +648,41 @@ app.put('/api/pedidos/:id', async (req, res) => {
         // Solo descontamos inventario si el estado cambia a 'Entregado'
         if (nuevoEstado === 'Entregado') {
             
-            // 1. Obtener los items del pedido
+            // 1. Obtener los items del pedido (Sin comillas en tabla)
             const itemsResult = await client.query(
-                'SELECT menu_producto_id, nombre_producto, cantidad FROM "pedido_items" WHERE pedido_id = $1', [id]
+                'SELECT menu_producto_id, nombre_producto, cantidad FROM pedido_items WHERE pedido_id = $1', [id]
             );
             
             for (const item of itemsResult.rows) {
                 // --- A. DESCUENTO DE LA RECETA BASE ---
-                // Buscamos si el producto principal tiene una receta vinculada
                 const recetaResult = await client.query(
-                    'SELECT receta_id FROM "menu_productos" WHERE id = $1', [item.menu_producto_id]
+                    'SELECT receta_id FROM menu_productos WHERE id = $1', [item.menu_producto_id]
                 );
 
                 if (recetaResult.rows.length > 0 && recetaResult.rows[0].receta_id) {
                     const recetaId = recetaResult.rows[0].receta_id;
                     const insumosResult = await client.query(
-                        'SELECT insumo_id, cantidad_necesaria FROM "receta_insumo" WHERE receta_id = $1', [recetaId]
+                        'SELECT insumo_id, cantidad_necesaria FROM receta_insumo WHERE receta_id = $1', [recetaId]
                     );
 
                     for (const insumo of insumosResult.rows) {
                         const cantidadADescontar = insumo.cantidad_necesaria * item.cantidad;
                         await client.query(
-                            'UPDATE "insumos" SET cantidad = cantidad - $1 WHERE id = $2', 
+                            'UPDATE insumos SET cantidad = cantidad - $1 WHERE id = $2', 
                             [cantidadADescontar, insumo.insumo_id]
                         );
                     }
                 }
 
                 // --- B. DESCUENTO DE MODIFICADORES (OPCIONES) ---
-                // El formato en la DB es: "Nombre Producto (Mod1, Mod2, Mod3)"
-                // Usamos una expresión regular para extraer lo que está dentro de los paréntesis
                 const match = item.nombre_producto.match(/\((.*)\)/);
                 
                 if (match) {
-                    // match[1] contiene "Mod1, Mod2, Mod3"
                     const modificadoresStr = match[1];
-                    // Separamos por comas y quitamos espacios extra
                     const modificadoresLista = modificadoresStr.split(',').map(m => m.trim());
 
                     for (const nombreModificador of modificadoresLista) {
-                        // Buscamos este modificador en la tabla menu_opciones para ver si tiene insumo vinculado
-                        // Usamos 'valor' porque es lo que se guarda en el nombre del producto (ej. "BBQ")
+                        // Verificamos si el modificador tiene configuración de inventario
                         const opcionResult = await client.query(
                             'SELECT insumo_id, cantidad_insumo FROM menu_opciones WHERE valor = $1 LIMIT 1',
                             [nombreModificador]
@@ -698,11 +691,11 @@ app.put('/api/pedidos/:id', async (req, res) => {
                         if (opcionResult.rows.length > 0) {
                             const { insumo_id, cantidad_insumo } = opcionResult.rows[0];
                             
-                            // Si tiene un insumo y cantidad configurados (Pasos 1 y 2 completados), descontamos
+                            // Solo descontamos si existen datos válidos (no nulos)
                             if (insumo_id && cantidad_insumo) {
                                 const totalModificador = parseFloat(cantidad_insumo) * item.cantidad;
                                 await client.query(
-                                    'UPDATE "insumos" SET cantidad = cantidad - $1 WHERE id = $2',
+                                    'UPDATE insumos SET cantidad = cantidad - $1 WHERE id = $2',
                                     [totalModificador, insumo_id]
                                 );
                             }
@@ -712,16 +705,16 @@ app.put('/api/pedidos/:id', async (req, res) => {
             }
         }
         
-        // Actualizar el estado del pedido
-        await client.query('UPDATE "pedidos" SET estado = $1 WHERE id = $2', [nuevoEstado, id]);
+        await client.query('UPDATE pedidos SET estado = $1 WHERE id = $2', [nuevoEstado, id]);
 
         await client.query('COMMIT');
-        res.status(200).json({ id, estado: nuevoEstado, mensaje: 'Pedido actualizado e inventario descontado (Receta + Modificadores).' });
+        res.status(200).json({ id, estado: nuevoEstado, mensaje: 'Pedido actualizado e inventario descontado.' });
 
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Error al actualizar pedido (ROLLBACK):', err);
-        res.status(500).json({ error: 'Error del servidor al actualizar el pedido.' });
+        // Enviamos el mensaje de error exacto para que puedas verlo en la consola del navegador si falla
+        res.status(500).json({ error: 'Error del servidor: ' + err.message });
     } finally {
         client.release();
     }
