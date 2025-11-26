@@ -884,12 +884,13 @@ app.get('/api/reportes/ventas', async (req, res) => {
     }
 
     try {
+        // 🚨 CORRECCIÓN: Usar 'fecha_creacion' y el operador '>=' para el inicio
         const query = `
             SELECT 
                 COUNT(id) AS total_pedidos, 
                 SUM(total) AS ventas_totales
             FROM Pedidos
-            WHERE fecha_registro::date = $1 AND fecha_creacion::date <= $2
+            WHERE fecha_creacion::date >= $1 AND fecha_creacion::date <= $2
               AND estado = 'Entregado';
         `;
         const values = [fechaInicio, fechaFin];
@@ -906,7 +907,7 @@ app.get('/api/reportes/ventas', async (req, res) => {
 
     } catch (err) {
         console.error('Error al generar reporte de ventas:', err);
-        res.status(500).json({ error: 'Error del servidor al generar el reporte.' });
+        res.status(500).json({ error: 'Error del servidor al generar el reporte: ' + err.message });
     }
 });
 
@@ -919,6 +920,7 @@ app.get('/api/reportes/inventario', async (req, res) => {
     }
 
     try {
+        // 🚨 CORRECCIÓN: Usar 'fecha_registro' que es la columna correcta en esta tabla
         const query = `
             SELECT 
                 fecha_registro,
@@ -927,7 +929,7 @@ app.get('/api/reportes/inventario', async (req, res) => {
                 unidad_medida,
                 categoria
             FROM Registro_Inventario
-            WHERE fecha_creacion::date = $1
+            WHERE fecha_registro::date = $1
             ORDER BY nombre_insumo;
         `;
         const result = await pool.query(query, [fecha]);
@@ -940,7 +942,7 @@ app.get('/api/reportes/inventario', async (req, res) => {
 
     } catch (err) {
         console.error('Error al generar reporte de inventario histórico:', err);
-        res.status(500).json({ error: 'Error del servidor al obtener el registro de inventario.' });
+        res.status(500).json({ error: 'Error del servidor al obtener el registro de inventario: ' + err.message });
     }
 });
 
