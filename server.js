@@ -314,6 +314,22 @@ app.delete('/api/menu/opciones/:id', async (req, res) => {
     }
 });
 
+// [DELETE] /api/menu/opciones/grupo/:nombre - Eliminar un grupo completo de modificadores
+app.delete('/api/menu/opciones/grupo/:nombre', async (req, res) => {
+    const nombreGrupo = req.params.nombre;
+    try {
+        // Borramos todas las opciones que tengan este nombre_opcion
+        const result = await pool.query('DELETE FROM menu_opciones WHERE nombre_opcion = $1 RETURNING *', [nombreGrupo]);
+        
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Grupo no encontrado.' });
+        }
+        res.status(200).json({ mensaje: `Grupo '${nombreGrupo}' eliminado con sus ${result.rowCount} opciones.` });
+    } catch (err) {
+        console.error('Error al eliminar grupo:', err);
+        res.status(500).json({ error: 'Error del servidor al eliminar el grupo.' });
+    }
+});
 
 // ======================================================================
 // ENDPOINTS DE INVENTARIO (CON CATEGORÍA, FILTROS Y REGISTRO FÍSICO)
