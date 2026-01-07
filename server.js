@@ -961,6 +961,41 @@ app.get('/api/reportes/inventario', async (req, res) => {
         res.status(500).json({ error: 'Error del servidor al obtener el registro de inventario: ' + err.message });
     }
 });
+// [GET] /api/reportes/platillos - Conteo de platillos vendidos
+app.get('/api/reportes/platillos', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+
+    if (!fechaInicio || !fechaFin) {
+        return res.status(400).json({ error: 'Se requieren fechaInicio y fechaFin.' });
+    }
+
+    try {
+        // Esta consulta une los items vendidos con el nombre "limpio" del producto base
+        const query = `
+            SELECT 
+                mp.nombre_venta AS producto, 
+                SUM(pi.cantidad) AS cantidad_vendida,
+                SUM(pi.cantidad * pi.precio_unitario) AS ingreso_generado
+            FROM pedido_items pi
+            JOIN pedidos p ON pi.pedido_id = p.id
+            JOIN menu_productos mp ON pi.menu_producto_id = mp.id
+            WHERE p.estado = 'Entregado'
+              AND p.fecha_creacion::date >= $1 
+              AND p.fecha_creacion::date <= $2
+            GROUP BY mp.nombre_venta
+            ORDER BY cantidad_vendida DESC;
+        `;
+        
+        const values = [fechaInicio, fechaFin];
+        const result = await pool.query(query, values);
+        
+        res.status(200).json(result.rows);
+
+    } catch (err) {
+        console.error('Error al generar reporte de platillos:', err);
+        res.status(500).json({ error: 'Error del servidor: ' + err.message });
+    }
+});
 
 // ======================================================================
 // INICIALIZACIÓN DEL SERVIDOR
