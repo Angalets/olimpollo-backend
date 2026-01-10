@@ -997,6 +997,119 @@ app.get('/api/reportes/platillos', async (req, res) => {
     }
 });
 
+// [GET] /api/reportes/insumos-teoricos - Cálculo de insumos teóricos basados en ventas
+app.get('/api/reportes/insumos-teoricos', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+
+    if (!fechaInicio || !fechaFin) {
+        return res.status(400).json({ error: 'Se requieren fechaInicio y fechaFin.' });
+    }
+
+    try {
+        const client = await pool.connect();
+        
+        // 1. Obtener todos los items vendidos en el periodo (solo entregados)
+        const ventasQuery = `
+            SELECT pi.menu_producto_id, pi.nombre_producto, pi.cantidad 
+            FROM pedido_items pi
+            JOIN pedidos p ON pi.pedido_id = p.id
+            WHERE p.estado = 'Entregado'
+              AND p.fecha_creacion::date >= $1 
+              AND p.fecha_creacion::date <= $2
+        `;
+        const ventasResult = await client.query(ventasQuery, [fechaInicio, fechaFin]);
+        const ventas = ventasResult.rows;
+
+        // 2. Obtener mapa de Recetas (Producto -> Insumos)
+        const recetasQuery = `
+            SELECT mp.id as producto_id, ri.insumo_id, i.nombre as nombre_insumo, ri.cantidad_necesaria, ri.unidad_medida
+            FROM menu_productos mp
+            JOIN recetas r ON mp.receta_id = r.id
+            JOIN receta_insumo ri ON r.id = ri.receta_id
+            JOIN insumos i ON ri.insumo_id = i.id
+        `;
+        const recetasResult = await client.query(recetasQuery);
+        
+        // Organizar recetas por ID de producto para acceso rápido
+        const recetasMap = {};
+        recetasResult.rows.forEach(r => {
+            if (!recetasMap[r.producto_id]) recetasMap[r.producto_id] = [];
+            recetasMap[r.producto_id].push(r);
+        });
+
+        // 3. Obtener mapa de Modificadores (Nombre Opción -> Insumo)
+        const opcionesQuery = `
+            SELECT mo.valor, mo.insumo_id, i.nombre as nombre_insumo, mo.cantidad_insumo, mo.unidad_insumo
+            FROM menu_opciones mo
+            JOIN insumos i ON mo.insumo_id = i.id
+            WHERE mo.insumo_id IS NOT NULL
+        `;
+        const opcionesResult = await client.query(opcionesQuery);
+        
+        // Organizar opciones por nombre (valor) para acceso rápido
+        const opcionesMap = {};
+        opcionesResult.rows.forEach(op => {
+            // Usamos mayúsculas para evitar errores de coincidencia
+            opcionesMap[op.valor.toUpperCase()] = op;
+        });
+
+        // 4. PROCESAMIENTO: Calcular totales
+        const usoTotal = {}; // Objeto para acumular: { "Pollo": { cantidad: 500, unidad: 'g' } }
+
+        ventas.forEach(venta => {
+            const cantidadVenta = venta.cantidad;
+
+            // A. Sumar insumos de la RECETA BASE
+            if (recetasMap[venta.menu_producto_id]) {
+                recetasMap[venta.menu_producto_id].forEach(insumo => {
+                    const nombre = insumo.nombre_insumo;
+                    const cantidad = parseFloat(insumo.cantidad_necesaria) * cantidadVenta;
+                    
+                    if (!usoTotal[nombre]) {
+                        usoTotal[nombre] = { cantidad: 0, unidad: insumo.unidad_medida };
+                    }
+                    usoTotal[nombre].cantidad += cantidad;
+                });
+            }
+
+            // B. Sumar insumos de los MODIFICADORES
+            // Extraer texto entre paréntesis: "Boneless (BBQ, Ranch)" -> "BBQ, Ranch"
+            const match = venta.nombre_producto.match(/\((.*)\)/);
+            if (match) {
+                const modificadores = match[1].split(',').map(m => m.trim().toUpperCase());
+                
+                modificadores.forEach(modNombre => {
+                    const opData = opcionesMap[modNombre];
+                    if (opData) {
+                        const nombre = opData.nombre_insumo;
+                        const cantidad = parseFloat(opData.cantidad_insumo) * cantidadVenta;
+
+                        if (!usoTotal[nombre]) {
+                            usoTotal[nombre] = { cantidad: 0, unidad: opData.unidad_insumo };
+                        }
+                        usoTotal[nombre].cantidad += cantidad;
+                    }
+                });
+            }
+        });
+
+        client.release();
+
+        // 5. Convertir objeto a array para enviar al front
+        const reporteFinal = Object.keys(usoTotal).map(key => ({
+            nombre_insumo: key,
+            cantidad_total: usoTotal[key].cantidad,
+            unidad: usoTotal[key].unidad
+        })).sort((a, b) => b.cantidad_total - a.cantidad_total); // Ordenar por mayor uso
+
+        res.status(200).json(reporteFinal);
+
+    } catch (err) {
+        console.error('Error al generar reporte de insumos teóricos:', err);
+        res.status(500).json({ error: 'Error del servidor: ' + err.message });
+    }
+});
+
 // ======================================================================
 // INICIALIZACIÓN DEL SERVIDOR
 // ======================================================================
