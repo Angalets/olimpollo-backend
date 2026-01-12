@@ -527,6 +527,64 @@ app.post('/api/inventario/guardar', async (req, res) => {
     }
 });
 
+// ======================================================================
+// ENDPOINTS DE COMPRAS (RE-STOCK)
+// ======================================================================
+
+// [POST] /api/compras - Registrar nueva compra y aumentar stock
+app.post('/api/compras', async (req, res) => {
+    const { proveedor, items, total_compra } = req.body;
+    // items debe ser un array: [{ insumo_id, cantidad, costo_unitario }, ...]
+
+    if (!items || items.length === 0) {
+        return res.status(400).json({ error: 'La compra debe tener al menos un insumo.' });
+    }
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN'); // Iniciar transacción segura
+
+        // 1. Insertar la cabecera de la compra
+        const compraQuery = `
+            INSERT INTO compras (proveedor, total_compra) 
+            VALUES ($1, $2) 
+            RETURNING id, fecha_compra
+        `;
+        const compraRes = await client.query(compraQuery, [proveedor || 'General', total_compra]);
+        const compraId = compraRes.rows[0].id;
+
+        // 2. Procesar cada item
+        for (const item of items) {
+            const { insumo_id, cantidad, costo_unitario } = item;
+            const subtotal = cantidad * costo_unitario;
+
+            // A. Insertar en detalle de compra
+            await client.query(
+                `INSERT INTO compra_items (compra_id, insumo_id, cantidad_comprada, costo_unitario, subtotal)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [compraId, insumo_id, cantidad, costo_unitario, subtotal]
+            );
+
+            // B. ACTUALIZAR INVENTARIO (Sumar stock)
+            await client.query(
+                `UPDATE insumos SET cantidad = cantidad + $1 WHERE id = $2`,
+                [cantidad, insumo_id]
+            );
+        }
+
+        await client.query('COMMIT'); // Confirmar cambios
+        res.status(201).json({ mensaje: 'Compra registrada y stock actualizado.', compraId });
+
+    } catch (err) {
+        await client.query('ROLLBACK'); // Cancelar si algo falla
+        console.error('Error al registrar compra:', err);
+        res.status(500).json({ error: 'Error al procesar la compra.' });
+    } finally {
+        client.release();
+    }
+});
+
 
 // ======================================================================
 // ENDPOINTS DE PEDIDOS (TABLAS PEDIDOS y PEDIDO_ITEMS)
