@@ -590,8 +590,9 @@ app.post('/api/compras', async (req, res) => {
 // ENDPOINTS DE PEDIDOS (TABLAS PEDIDOS y PEDIDO_ITEMS)
 // ======================================================================
 
-// [GET] /api/pedidos - 🚨 MODIFICADO PARA ACEPTAR FILTROS DE FECHA
+// [GET] /api/pedidos - LISTA CON FILTROS Y ZONA HORARIA
 app.get('/api/pedidos', async (req, res) => {
+    // Actualizar estados pendientes viejos (opcional, manteniendo tu lógica)
     await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '1 hour';`);
 
     const { canal, estado, fechaInicio, fechaFin } = req.query; 
@@ -599,6 +600,7 @@ app.get('/api/pedidos', async (req, res) => {
     let values = [];
     let paramIndex = 1;
 
+    // Filtros
     if (canal && canal !== 'Todos') {
         whereClauses.push(`p.canal_venta = $${paramIndex++}`);
         values.push(canal);
@@ -607,12 +609,13 @@ app.get('/api/pedidos', async (req, res) => {
         whereClauses.push(`p.estado = $${paramIndex++}`);
         values.push(estado);
     }
+    // CORRECCIÓN DE FECHAS CON ZONA HORARIA
     if (fechaInicio) {
-        whereClauses.push(`p.fecha_creacion::date >= $${paramIndex++}`);
+        whereClauses.push(`(p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date >= $${paramIndex++}`);
         values.push(fechaInicio);
     }
     if (fechaFin) {
-        whereClauses.push(`p.fecha_creacion::date <= $${paramIndex++}`);
+        whereClauses.push(`(p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date <= $${paramIndex++}`);
         values.push(fechaFin);
     }
     
@@ -632,7 +635,7 @@ app.get('/api/pedidos', async (req, res) => {
             JOIN pedido_items pi ON p.id = pi.pedido_id 
             ${whereClause} 
             GROUP BY p.id 
-            ORDER BY p.fecha_creacion DESC; -- Cambiado a DESC para Lista de Pedidos (más nuevos primero)
+            ORDER BY p.fecha_creacion DESC;
         `;
         const result = await pool.query(query, values);
         const pedidos = result.rows.map(p => ({ 
@@ -642,7 +645,7 @@ app.get('/api/pedidos', async (req, res) => {
         }));
         res.status(200).json(pedidos);
     } catch (err) {
-        console.error('Error al obtener pedidos con filtros:', err);
+        console.error('Error al obtener pedidos:', err);
         res.status(500).json({ error: 'Error del servidor al obtener los pedidos.' });
     }
 });
@@ -949,7 +952,7 @@ app.delete('/api/recetas/:id', async (req, res) => {
 // ENDPOINTS DE REPORTES
 // ======================================================================
 
-// [GET] /api/reportes/ventas - Generar reporte de ventas por rango de fechas
+// [GET] /api/reportes/ventas - Generar reporte de ventas (CON ZONA HORARIA HERMOSILLO)
 app.get('/api/reportes/ventas', async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
 
@@ -958,13 +961,14 @@ app.get('/api/reportes/ventas', async (req, res) => {
     }
 
     try {
-        // 🚨 CORRECCIÓN: Usar 'fecha_creacion' y el operador '>=' para el inicio
+        // CORRECCIÓN: Convertimos la fecha UTC a Hermosillo antes de comparar
         const query = `
             SELECT 
                 COUNT(id) AS total_pedidos, 
                 SUM(total) AS ventas_totales
             FROM Pedidos
-            WHERE fecha_creacion::date >= $1 AND fecha_creacion::date <= $2
+            WHERE (fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date >= $1 
+              AND (fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date <= $2
               AND estado = 'Entregado';
         `;
         const values = [fechaInicio, fechaFin];
@@ -981,7 +985,7 @@ app.get('/api/reportes/ventas', async (req, res) => {
 
     } catch (err) {
         console.error('Error al generar reporte de ventas:', err);
-        res.status(500).json({ error: 'Error del servidor al generar el reporte: ' + err.message });
+        res.status(500).json({ error: 'Error del servidor al generar el reporte.' });
     }
 });
 
@@ -1038,8 +1042,8 @@ app.get('/api/reportes/platillos', async (req, res) => {
             JOIN pedidos p ON pi.pedido_id = p.id
             JOIN menu_productos mp ON pi.menu_producto_id = mp.id
             WHERE p.estado = 'Entregado'
-              AND p.fecha_creacion::date >= $1 
-              AND p.fecha_creacion::date <= $2
+  AND (p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date >= $1 
+  AND (p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date <= $2
             GROUP BY mp.nombre_venta
             ORDER BY cantidad_vendida DESC;
         `;
@@ -1072,8 +1076,8 @@ app.get('/api/reportes/insumos-teoricos', async (req, res) => {
             FROM pedido_items pi
             JOIN pedidos p ON pi.pedido_id = p.id
             WHERE p.estado = 'Entregado'
-              AND p.fecha_creacion::date >= $1 
-              AND p.fecha_creacion::date <= $2
+  AND (p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date >= $1 
+  AND (p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date <= $2
         `;
         const ventasResult = await client.query(ventasQuery, [fechaInicio, fechaFin]);
         const ventas = ventasResult.rows;
