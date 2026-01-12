@@ -1172,6 +1172,22 @@ app.get('/api/reportes/insumos-teoricos', async (req, res) => {
     }
 });
 
+// [GET] /api/debug/hora - Para verificar qué hora tiene el servidor
+app.get('/api/debug/hora', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT 
+                NOW() as hora_servidor_utc,
+                NOW()::date as fecha_directa_utc,
+                (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo') as hora_hermosillo,
+                (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date as fecha_hermosillo
+        `);
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.json({ error: err.message });
+    }
+});
+
 // ======================================================================
 // INICIALIZACIÓN DEL SERVIDOR
 // ======================================================================
