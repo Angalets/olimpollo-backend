@@ -591,8 +591,9 @@ app.post('/api/compras', async (req, res) => {
 // ======================================================================
 
 // [GET] /api/pedidos - LISTA CON FILTROS Y ZONA HORARIA
+// [GET] /api/pedidos - LISTA CON ZONA HORARIA CORREGIDA
 app.get('/api/pedidos', async (req, res) => {
-    // Actualizar estados pendientes viejos (opcional, manteniendo tu lógica)
+    // Actualizar estados pendientes viejos
     await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '1 hour';`);
 
     const { canal, estado, fechaInicio, fechaFin } = req.query; 
@@ -609,13 +610,14 @@ app.get('/api/pedidos', async (req, res) => {
         whereClauses.push(`p.estado = $${paramIndex++}`);
         values.push(estado);
     }
-    // CORRECCIÓN DE FECHAS CON ZONA HORARIA
+    
+    // 🚨 CORRECCIÓN DE FECHAS: Salto directo a Hermosillo
     if (fechaInicio) {
-        whereClauses.push(`(p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date >= $${paramIndex++}`);
+        whereClauses.push(`(p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $${paramIndex++}`);
         values.push(fechaInicio);
     }
     if (fechaFin) {
-        whereClauses.push(`(p.fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date <= $${paramIndex++}`);
+        whereClauses.push(`(p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $${paramIndex++}`);
         values.push(fechaFin);
     }
     
@@ -953,6 +955,7 @@ app.delete('/api/recetas/:id', async (req, res) => {
 // ======================================================================
 
 // [GET] /api/reportes/ventas - Generar reporte de ventas (CON ZONA HORARIA HERMOSILLO)
+// [GET] /api/reportes/ventas - CORREGIDO (Salto directo a Hermosillo)
 app.get('/api/reportes/ventas', async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
 
@@ -961,14 +964,14 @@ app.get('/api/reportes/ventas', async (req, res) => {
     }
 
     try {
-        // CORRECCIÓN: Convertimos la fecha UTC a Hermosillo antes de comparar
+        // CORRECCIÓN: Usamos un solo AT TIME ZONE para obtener la hora local real
         const query = `
             SELECT 
                 COUNT(id) AS total_pedidos, 
                 SUM(total) AS ventas_totales
             FROM Pedidos
-            WHERE (fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date >= $1 
-              AND (fecha_creacion AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date <= $2
+            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 
+              AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
               AND estado = 'Entregado';
         `;
         const values = [fechaInicio, fechaFin];
@@ -1173,14 +1176,14 @@ app.get('/api/reportes/insumos-teoricos', async (req, res) => {
 });
 
 // [GET] /api/debug/hora - Para verificar qué hora tiene el servidor
+// [GET] /api/debug/hora - Verificación de hora local
 app.get('/api/debug/hora', async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT 
                 NOW() as hora_servidor_utc,
-                NOW()::date as fecha_directa_utc,
-                (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo') as hora_hermosillo,
-                (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Hermosillo')::date as fecha_hermosillo
+                (NOW() AT TIME ZONE 'America/Hermosillo') as hora_hermosillo_correcta,
+                (NOW() AT TIME ZONE 'America/Hermosillo')::date as fecha_hermosillo_correcta
         `);
         res.json(result.rows[0]);
     } catch (err) {
