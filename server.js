@@ -747,11 +747,21 @@ app.post('/api/pedidos', async (req, res) => {
         const pedidoId = pedidoResult.rows[0].id;
 
         for (const item of items) {
+            // ACTUALIZACIÓN: Ahora guardamos también la columna 'notas'
             const itemQuery = `
                 INSERT INTO pedido_items 
-                    (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario) 
-                VALUES ($1, $2, $3, $4, $5)`;
-            const itemValues = [pedidoId, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario];
+                    (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas) 
+                VALUES ($1, $2, $3, $4, $5, $6)`;
+            
+            // Si no hay nota, guardamos NULL o string vacío
+            const itemValues = [
+                pedidoId, 
+                item.menu_producto_id, 
+                item.nombre_producto_completo, 
+                item.cantidad, 
+                item.precio_unitario,
+                item.notas || '' // <--- AQUÍ VA LA NOTA
+            ];
             await client.query(itemQuery, itemValues);
         }
 
