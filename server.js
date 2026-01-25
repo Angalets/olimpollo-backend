@@ -531,10 +531,9 @@ app.post('/api/inventario/guardar', async (req, res) => {
 // ENDPOINTS DE COMPRAS (RE-STOCK)
 // ======================================================================
 
-// [POST] /api/compras - Registrar nueva compra y aumentar stock
+// [POST] /api/compras - Registrar compra, aumentar stock y ACTUALIZAR COSTO PROMEDIO
 app.post('/api/compras', async (req, res) => {
     const { proveedor, items, total_compra } = req.body;
-    // items debe ser un array: [{ insumo_id, cantidad, costo_unitario }, ...]
 
     if (!items || items.length === 0) {
         return res.status(400).json({ error: 'La compra debe tener al menos un insumo.' });
@@ -543,15 +542,13 @@ app.post('/api/compras', async (req, res) => {
     const client = await pool.connect();
 
     try {
-        await client.query('BEGIN'); // Iniciar transacción segura
+        await client.query('BEGIN');
 
-        // 1. Insertar la cabecera de la compra
-        const compraQuery = `
-            INSERT INTO compras (proveedor, total_compra) 
-            VALUES ($1, $2) 
-            RETURNING id, fecha_compra
-        `;
-        const compraRes = await client.query(compraQuery, [proveedor || 'General', total_compra]);
+        // 1. Insertar Cabecera
+        const compraRes = await client.query(
+            'INSERT INTO compras (proveedor, total_compra) VALUES ($1, $2) RETURNING id',
+            [proveedor || 'General', total_compra]
+        );
         const compraId = compraRes.rows[0].id;
 
         // 2. Procesar cada item
@@ -559,27 +556,51 @@ app.post('/api/compras', async (req, res) => {
             const { insumo_id, cantidad, costo_unitario } = item;
             const subtotal = cantidad * costo_unitario;
 
-            // A. Insertar en detalle de compra
+            // A. Insertar historial de compra
             await client.query(
                 `INSERT INTO compra_items (compra_id, insumo_id, cantidad_comprada, costo_unitario, subtotal)
                  VALUES ($1, $2, $3, $4, $5)`,
                 [compraId, insumo_id, cantidad, costo_unitario, subtotal]
             );
 
-            // B. ACTUALIZAR INVENTARIO (Sumar stock)
-            await client.query(
-                `UPDATE insumos SET cantidad = cantidad + $1 WHERE id = $2`,
-                [cantidad, insumo_id]
-            );
+            // --- B. LÓGICA DE COSTO PROMEDIO PONDERADO ---
+            // 1. Obtener stock actual y costo actual antes de sumar lo nuevo
+            const insumoActual = await client.query('SELECT cantidad, costo_promedio FROM insumos WHERE id = $1', [insumo_id]);
+            
+            if (insumoActual.rows.length > 0) {
+                const stockActual = parseFloat(insumoActual.rows[0].cantidad) || 0;
+                const costoActual = parseFloat(insumoActual.rows[0].costo_promedio) || 0;
+
+                // Valor total actual en inventario ($)
+                const valorInventarioActual = stockActual * costoActual;
+                // Valor de lo que acabamos de comprar ($)
+                const valorCompraNueva = cantidad * costo_unitario;
+
+                // Nuevo Stock Total
+                const nuevoStock = stockActual + parseFloat(cantidad);
+                
+                // Nuevo Costo Promedio = (Valor Total / Nuevo Stock)
+                // Evitamos división por cero
+                let nuevoCostoPromedio = costo_unitario; 
+                if (nuevoStock > 0) {
+                    nuevoCostoPromedio = (valorInventarioActual + valorCompraNueva) / nuevoStock;
+                }
+
+                // Actualizamos Cantidad y Costo Promedio en la BD
+                await client.query(
+                    `UPDATE insumos SET cantidad = $1, costo_promedio = $2 WHERE id = $3`,
+                    [nuevoStock, nuevoCostoPromedio, insumo_id]
+                );
+            }
         }
 
-        await client.query('COMMIT'); // Confirmar cambios
-        res.status(201).json({ mensaje: 'Compra registrada y stock actualizado.', compraId });
+        await client.query('COMMIT');
+        res.status(201).json({ mensaje: 'Compra registrada, stock y costos actualizados.', compraId });
 
     } catch (err) {
-        await client.query('ROLLBACK'); // Cancelar si algo falla
-        console.error('Error al registrar compra:', err);
-        res.status(500).json({ error: 'Error al procesar la compra.' });
+        await client.query('ROLLBACK');
+        console.error('Error compra:', err);
+        res.status(500).json({ error: 'Error al procesar compra.' });
     } finally {
         client.release();
     }
