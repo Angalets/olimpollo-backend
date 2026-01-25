@@ -691,11 +691,10 @@ app.delete('/api/pedidos/:id', async (req, res) => {
     }
 });
 
-// [POST] /api/pedidos
-// [POST] /api/pedidos - Crear nuevo pedido con MÉTODO DE PAGO
+// [POST] /api/pedidos - Crear pedido y gestionar CLIENTE (CRM)
 app.post('/api/pedidos', async (req, res) => {
-    // 1. Recibimos 'metodo_pago' del frontend
-    const { cliente, items, canal_venta, total_ajustado, metodo_pago } = req.body;
+    // 1. Ahora recibimos también 'telefono'
+    const { cliente, telefono, items, canal_venta, total_ajustado, metodo_pago } = req.body;
 
     if (!cliente || !items || items.length === 0) {
         return res.status(400).json({ error: 'Faltan datos de cliente o items.' });
@@ -708,13 +707,40 @@ app.post('/api/pedidos', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 2. Insertamos incluyendo el metodo_pago
+        // --- LÓGICA CRM: GESTIÓN DE CLIENTE ---
+        if (telefono) {
+            // Buscamos si el cliente existe por teléfono
+            const clienteExistente = await client.query('SELECT id FROM clientes WHERE telefono = $1', [telefono]);
+
+            if (clienteExistente.rows.length > 0) {
+                // A) CLIENTE EXISTENTE: Actualizamos sus stats
+                await client.query(`
+                    UPDATE clientes 
+                    SET visitas = visitas + 1, 
+                        total_gastado = total_gastado + $1,
+                        ultima_visita = NOW(),
+                        nombre = $2 -- Actualizamos nombre por si lo corrigieron
+                    WHERE telefono = $3
+                `, [totalFinal, cliente, telefono]);
+            } else {
+                // B) CLIENTE NUEVO: Lo registramos
+                // Puntos iniciales: 1 por visita (puedes cambiar la lógica después)
+                await client.query(`
+                    INSERT INTO clientes (telefono, nombre, visitas, total_gastado, puntos)
+                    VALUES ($1, $2, 1, $3, 1)
+                `, [telefono, cliente, totalFinal]);
+            }
+        }
+        // --------------------------------------
+
+        // 2. Insertamos el pedido (Guardamos el teléfono en la tabla pedidos también si quieres, o solo el nombre)
+        // Nota: Si quieres guardar el teléfono en la tabla 'pedidos' también, deberías agregar esa columna a la tabla pedidos primero.
+        // Por ahora lo guardaremos vinculado por lógica, pero el pedido guarda el nombre del cliente.
         const pedidoQuery = `
             INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago) 
             VALUES ($1, $2, $3, $4) 
             RETURNING id
         `;
-        // Si no envían método, asumimos 'Efectivo' por defecto
         const pedidoValues = [cliente, totalFinal, canal_venta || 'OyR', metodo_pago || 'Efectivo'];
         
         const pedidoResult = await client.query(pedidoQuery, pedidoValues);
@@ -737,6 +763,21 @@ app.post('/api/pedidos', async (req, res) => {
         res.status(500).json({ error: 'Error del servidor al crear el pedido.' });
     } finally {
         client.release();
+    }
+});
+
+// [GET] /api/clientes/:telefono - Buscar cliente para el POS
+app.get('/api/clientes/:telefono', async (req, res) => {
+    const { telefono } = req.params;
+    try {
+        const result = await pool.query('SELECT * FROM clientes WHERE telefono = $1', [telefono]);
+        if (result.rows.length > 0) {
+            res.json(result.rows[0]);
+        } else {
+            res.status(404).json({ mensaje: 'Cliente no encontrado' });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
