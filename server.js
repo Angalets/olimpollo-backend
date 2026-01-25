@@ -652,8 +652,9 @@ app.get('/api/pedidos', async (req, res) => {
                 json_agg(json_build_object(
                     'nombre_producto', pi.nombre_producto, 
                     'cantidad', pi.cantidad, 
-                    'precio_unitario', CAST(pi.precio_unitario AS TEXT)
-                )) AS items 
+                    'precio_unitario', CAST(pi.precio_unitario AS TEXT),
+                    'notas', pi.notas  // <--- AGREGAR ESTO
+                )) AS items
             FROM pedidos p 
             JOIN pedido_items pi ON p.id = pi.pedido_id 
             ${whereClause} 
