@@ -692,8 +692,11 @@ app.delete('/api/pedidos/:id', async (req, res) => {
 });
 
 // [POST] /api/pedidos
+// [POST] /api/pedidos - Crear nuevo pedido con MÉTODO DE PAGO
 app.post('/api/pedidos', async (req, res) => {
-    const { cliente, items, canal_venta, total_ajustado } = req.body;
+    // 1. Recibimos 'metodo_pago' del frontend
+    const { cliente, items, canal_venta, total_ajustado, metodo_pago } = req.body;
+
     if (!cliente || !items || items.length === 0) {
         return res.status(400).json({ error: 'Faltan datos de cliente o items.' });
     }
@@ -705,8 +708,16 @@ app.post('/api/pedidos', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const pedidoQuery = 'INSERT INTO pedidos (cliente, total, canal_venta) VALUES ($1, $2, $3) RETURNING id';
-        const pedidoResult = await client.query(pedidoQuery, [cliente, totalFinal, canal_venta || 'OyR']);
+        // 2. Insertamos incluyendo el metodo_pago
+        const pedidoQuery = `
+            INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago) 
+            VALUES ($1, $2, $3, $4) 
+            RETURNING id
+        `;
+        // Si no envían método, asumimos 'Efectivo' por defecto
+        const pedidoValues = [cliente, totalFinal, canal_venta || 'OyR', metodo_pago || 'Efectivo'];
+        
+        const pedidoResult = await client.query(pedidoQuery, pedidoValues);
         const pedidoId = pedidoResult.rows[0].id;
 
         for (const item of items) {
@@ -719,7 +730,7 @@ app.post('/api/pedidos', async (req, res) => {
         }
 
         await client.query('COMMIT');
-        res.status(201).json({ id: pedidoId, cliente, total: totalFinal });
+        res.status(201).json({ id: pedidoId, cliente, total: totalFinal, metodo_pago });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Error al crear pedido (ROLLBACK):', err);
