@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------------
-// server.js - Back-End para Olimpollo (VERSIÓN MAESTRA FINAL)
+// server.js - Back-End Olimpollo (VERSIÓN MAESTRA FINAL - CORREGIDA)
 // ----------------------------------------------------------------------
 
 const express = require('express');
@@ -312,8 +312,9 @@ app.get('/api/pedidos', async (req, res) => {
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     
+    // Consulta Actualizada: Trae comision y metodo_pago
     const query = `
-        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, p.fecha_creacion, p.canal_venta, p.metodo_pago,
+        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago,
         json_agg(json_build_object(
             'nombre_producto', pi.nombre_producto, 
             'cantidad', pi.cantidad, 
@@ -327,20 +328,33 @@ app.get('/api/pedidos', async (req, res) => {
 
     try {
         const result = await pool.query(query, values);
-        const pedidos = result.rows.map(p => ({ ...p, total: parseFloat(p.total), items: p.items.map(i => ({ ...i, precio_unitario: parseFloat(i.precio_unitario) })) }));
+        const pedidos = result.rows.map(p => ({ 
+            ...p, 
+            total: parseFloat(p.total), 
+            comision: parseFloat(p.comision || 0), // Parseamos la comisión
+            items: p.items.map(i => ({ ...i, precio_unitario: parseFloat(i.precio_unitario) })) 
+        }));
         res.status(200).json(pedidos);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST: Crear Pedido (Con CRM y Notas)
+// POST: Crear Pedido (Con CRM, Notas y Comisiones)
 app.post('/api/pedidos', async (req, res) => {
     const { cliente, telefono, items, canal_venta, total_ajustado, metodo_pago } = req.body;
     if (!cliente || !items.length) return res.status(400).json({ error: 'Datos incompletos' });
 
     const totalCalculado = items.reduce((sum, i) => sum + (i.cantidad * i.precio_unitario), 0);
     const totalFinal = total_ajustado ?? totalCalculado;
-    const client = await pool.connect();
+    
+    // --- NUEVA LÓGICA DE COMISIÓN ---
+    let comision = 0;
+    // Si paga con Tarjeta, calculamos 3.6% + IVA (16%)
+    // Fórmula simplificada: Total * 0.04176
+    if (metodo_pago === 'Tarjeta') {
+        comision = totalFinal * 0.04176;
+    }
 
+    const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
@@ -356,9 +370,9 @@ app.post('/api/pedidos', async (req, res) => {
             }
         }
 
-        // 2. Insertar Pedido
-        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago) VALUES ($1, $2, $3, $4) RETURNING id', 
-            [cliente, totalFinal, canal_venta || 'OyR', metodo_pago || 'Efectivo']);
+        // 2. Insertar Pedido (Incluyendo la comisión calculada)
+        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, comision) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
+            [cliente, totalFinal, canal_venta || 'OyR', metodo_pago || 'Efectivo', comision]);
         const pedidoId = pedRes.rows[0].id;
 
         // 3. Insertar Items con Notas
@@ -368,7 +382,7 @@ app.post('/api/pedidos', async (req, res) => {
         }
 
         await client.query('COMMIT');
-        res.status(201).json({ id: pedidoId, mensaje: 'Pedido guardado' });
+        res.status(201).json({ id: pedidoId, mensaje: 'Pedido guardado', comision: comision.toFixed(2) });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(err);
@@ -440,7 +454,7 @@ app.get('/api/clientes/:telefono', async (req, res) => {
 
 
 // ======================================================================
-// 8. RECETAS
+// 8. RECETAS (Endpoint Corregido)
 // ======================================================================
 app.get('/api/recetas', async (req, res) => {
     const query = `SELECT r.id, r.nombre, r.descripcion, r.pasos, 
@@ -469,6 +483,29 @@ app.post('/api/recetas', async (req, res) => {
     } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
+// Endpoint PUT Recuperado
+app.put('/api/recetas/:id', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { nombre, descripcion, pasos, ingredientes, producto_venta_id } = req.body;
+    const client = await pool.connect();
+
+    if (!nombre || !ingredientes) return res.status(400).json({ error: 'Datos faltantes' });
+
+    try {
+        await client.query('BEGIN');
+        await client.query('UPDATE recetas SET nombre = $1, descripcion = $2, pasos = $3 WHERE id = $4', [nombre, descripcion, pasos, id]);
+        await client.query('DELETE FROM receta_insumo WHERE receta_id = $1', [id]);
+        for (const ing of ingredientes) {
+            await client.query('INSERT INTO receta_insumo (receta_id, insumo_id, cantidad_necesaria, unidad_medida) VALUES ($1, $2, $3, $4)', 
+                [id, ing.insumo_id, ing.cantidad_necesaria, ing.unidad_medida]);
+        }
+        await client.query('UPDATE menu_productos SET receta_id = NULL WHERE receta_id = $1', [id]);
+        if (producto_venta_id) await client.query('UPDATE menu_productos SET receta_id = $1 WHERE id = $2', [id, producto_venta_id]);
+        await client.query('COMMIT');
+        res.status(200).json({ mensaje: 'Receta actualizada' });
+    } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
+});
+
 app.delete('/api/recetas/:id', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -486,17 +523,22 @@ app.delete('/api/recetas/:id', async (req, res) => {
 // 9. REPORTES (ESTADÍSTICAS)
 // ======================================================================
 
-// Ventas (Con Zona Horaria Correcta)
+// Ventas (Con Zona Horaria Correcta y Comisiones)
 app.get('/api/reportes/ventas', async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
     try {
-        const query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales FROM Pedidos 
-            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2 AND estado = 'Entregado'`;
+        // Agregamos SUM(comision)
+        const query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales 
+            FROM Pedidos 
+            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2 
+            AND estado = 'Entregado'`;
         const result = await pool.query(query, [fechaInicio, fechaFin]);
         res.status(200).json({
             fechaInicio, fechaFin, 
             total_pedidos: parseInt(result.rows[0].total_pedidos || 0), 
-            ventas_totales: parseFloat(result.rows[0].ventas_totales || 0).toFixed(2)
+            ventas_totales: parseFloat(result.rows[0].ventas_totales || 0).toFixed(2),
+            comisiones: parseFloat(result.rows[0].comisiones_totales || 0).toFixed(2)
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -510,6 +552,18 @@ app.get('/api/reportes/platillos', async (req, res) => {
             WHERE p.estado = 'Entregado' AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
             GROUP BY mp.nombre_venta ORDER BY cantidad_vendida DESC`;
         const result = await pool.query(query, [fechaInicio, fechaFin]);
+        res.status(200).json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Reporte Histórico de Inventario (Recuperado)
+app.get('/api/reportes/inventario', async (req, res) => {
+    const { fecha } = req.query;
+    if (!fecha) return res.status(400).json({ error: 'Falta fecha' });
+    try {
+        const query = `SELECT fecha_registro, nombre_insumo, cantidad_registrada, unidad_medida, categoria 
+            FROM Registro_Inventario WHERE fecha_registro::date = $1 ORDER BY nombre_insumo`;
+        const result = await pool.query(query, [fecha]);
         res.status(200).json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
