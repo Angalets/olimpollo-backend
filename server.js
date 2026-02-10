@@ -338,7 +338,7 @@ app.get('/api/pedidos', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST: Crear Pedido (Con CRM, Notas y Comisiones)
+// [POST] /api/pedidos - Crear Pedido (Con CRM, Notas y Comisiones de Tarjeta/Apps)
 app.post('/api/pedidos', async (req, res) => {
     const { cliente, telefono, items, canal_venta, total_ajustado, metodo_pago } = req.body;
     if (!cliente || !items.length) return res.status(400).json({ error: 'Datos incompletos' });
@@ -346,12 +346,15 @@ app.post('/api/pedidos', async (req, res) => {
     const totalCalculado = items.reduce((sum, i) => sum + (i.cantidad * i.precio_unitario), 0);
     const totalFinal = total_ajustado ?? totalCalculado;
     
-    // --- NUEVA LÓGICA DE COMISIÓN ---
+    // --- LÓGICA DE COMISIÓN ACTUALIZADA ---
     let comision = 0;
-    // Si paga con Tarjeta, calculamos 3.6% + IVA (16%)
-    // Fórmula simplificada: Total * 0.04176
+
     if (metodo_pago === 'Tarjeta') {
+        // Tarjeta: 3.6% + IVA (16%) = 4.176%
         comision = totalFinal * 0.04176;
+    } else if (metodo_pago === 'Aplicación') {
+        // Apps (Uber/Didi/Rappi): 42.13% (Promedio configurado)
+        comision = totalFinal * 0.4213;
     }
 
     const client = await pool.connect();
@@ -362,10 +365,8 @@ app.post('/api/pedidos', async (req, res) => {
         if (telefono) {
             const existe = await client.query('SELECT id FROM clientes WHERE telefono = $1', [telefono]);
             if (existe.rows.length > 0) {
-                // Actualizar cliente existente
                 await client.query('UPDATE clientes SET visitas = visitas + 1, total_gastado = total_gastado + $1, ultima_visita = NOW(), nombre = $2 WHERE telefono = $3', [totalFinal, cliente, telefono]);
             } else {
-                // Crear nuevo cliente
                 await client.query('INSERT INTO clientes (telefono, nombre, visitas, total_gastado, puntos) VALUES ($1, $2, 1, $3, 1)', [telefono, cliente, totalFinal]);
             }
         }
