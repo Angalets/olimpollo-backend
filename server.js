@@ -524,6 +524,107 @@ app.delete('/api/recetas/:id', async (req, res) => {
 // 9. REPORTES (ESTADÍSTICAS)
 // ======================================================================
 
+// REPORTE SEMANAL GERENCIAL (Ventas + Compras Sugeridas)
+app.get('/api/reportes/semanal', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    
+    try {
+        const client = await pool.connect();
+        
+        // 1. ANÁLISIS FINANCIERO (Desglose por Canal y Método de Pago)
+        // Agrupa por canal (Uber/Didi/OyR) y método (Efectivo/Tarjeta)
+        const ventasQuery = `
+            SELECT 
+                canal_venta,
+                metodo_pago,
+                COUNT(id) as pedidos,
+                SUM(total) as venta_bruta,
+                SUM(comision) as comisiones
+            FROM Pedidos
+            WHERE estado = 'Entregado'
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+            GROUP BY canal_venta, metodo_pago
+            ORDER BY canal_venta, metodo_pago
+        `;
+        const ventasRes = await client.query(ventasQuery, [fechaInicio, fechaFin]);
+
+        // 2. STOCK Y LISTA DE COMPRAS (Agrupado por Proveedor)
+        // Busca todo lo que esté bajo de stock o agotado
+        const stockQuery = `
+            SELECT 
+                proveedor_preferido,
+                nombre,
+                cantidad,
+                unidad,
+                stock_minimo,
+                (stock_minimo - cantidad) as faltante_sugerido,
+                costo_promedio
+            FROM Insumos
+            WHERE cantidad <= stock_minimo
+            ORDER BY proveedor_preferido, nombre
+        `;
+        const stockRes = await client.query(stockQuery);
+
+        client.release();
+
+        // 3. Procesamiento de Datos para el Frontend
+        let financiero = {
+            detalles: ventasRes.rows,
+            total_bruto: 0,
+            total_comisiones: 0,
+            total_neto: 0,
+            apps_detalle: {} // Para saber cuánto vendió cada app específicamente
+        };
+
+        ventasRes.rows.forEach(row => {
+            const bruta = parseFloat(row.venta_bruta);
+            const comision = parseFloat(row.comisiones);
+            
+            financiero.total_bruto += bruta;
+            financiero.total_comisiones += comision;
+            
+            // Agrupar totales por App
+            if (['Uber', 'Didi', 'Rappi'].includes(row.canal_venta)) {
+                if (!financiero.apps_detalle[row.canal_venta]) financiero.apps_detalle[row.canal_venta] = 0;
+                financiero.apps_detalle[row.canal_venta] += bruta;
+            }
+        });
+        
+        financiero.total_neto = financiero.total_bruto - financiero.total_comisiones;
+
+        // Agrupar Compras por Proveedor
+        let compras_sugeridas = {};
+        let costo_estimado_resurtido = 0;
+
+        stockRes.rows.forEach(item => {
+            const prov = item.proveedor_preferido || 'Sin Asignar';
+            if (!compras_sugeridas[prov]) compras_sugeridas[prov] = [];
+            
+            // Calculamos cuánto costaría rellenar el stock al mínimo
+            const costoEstimado = item.faltante_sugerido * parseFloat(item.costo_promedio || 0);
+            if (costoEstimado > 0) costo_estimado_resurtido += costoEstimado;
+
+            compras_sugeridas[prov].push({
+                nombre: item.nombre,
+                stock_actual: parseFloat(item.cantidad),
+                minimo: item.stock_minimo,
+                pedir: parseFloat(item.faltante_sugerido).toFixed(2) + ' ' + item.unidad,
+                estado: item.cantidad <= 0 ? 'AGOTADO 🔴' : 'BAJO ⚠️'
+            });
+        });
+
+        res.json({
+            financiero,
+            compras: compras_sugeridas,
+            costo_estimado_resurtido: costo_estimado_resurtido.toFixed(2)
+        });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Ventas (Con Zona Horaria Correcta y Comisiones)
 app.get('/api/reportes/ventas', async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
