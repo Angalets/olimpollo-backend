@@ -714,6 +714,58 @@ app.get('/api/corte/preview', async (req, res) => {
     }
 });
 
+// 2. Guardar el Corte Definitivo (ESTE ES EL BLOQUE QUE TE FALTA)
+app.post('/api/corte', async (req, res) => {
+    try {
+        console.log("Recibiendo petición de corte:", req.body); 
+
+        const { usuario, totales_esperados, totales_reales, observaciones } = req.body;
+        
+        // Validación básica
+        if (!totales_esperados || !totales_reales) {
+            return res.status(400).json({ error: "Datos incompletos" });
+        }
+
+        // Cálculos seguros
+        const total_ventas = Object.values(totales_esperados).reduce((a, b) => a + parseFloat(b || 0), 0);
+        
+        const real_efectivo = parseFloat(totales_reales.efectivo || 0);
+        const real_tarjeta = parseFloat(totales_reales.tarjeta || 0);
+        
+        const esperado_efectivo = parseFloat(totales_esperados.Efectivo || 0);
+        const esperado_tarjeta = parseFloat(totales_esperados.Tarjeta || 0);
+        
+        const diferencia = real_efectivo - esperado_efectivo; 
+
+        // Guardar en BD
+        const query = `
+            INSERT INTO cortes_caja 
+            (usuario, total_ventas, esperado_efectivo, esperado_tarjeta, esperado_transferencia, esperado_apps, real_efectivo, real_tarjeta, diferencia, observaciones)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id, fecha_corte
+        `;
+        const values = [
+            usuario || 'Anonimo', 
+            total_ventas,
+            esperado_efectivo, 
+            esperado_tarjeta, 
+            parseFloat(totales_esperados.Transferencia || 0), 
+            parseFloat(totales_esperados['Aplicación'] || 0),
+            real_efectivo, 
+            real_tarjeta,
+            diferencia, 
+            observaciones || ''
+        ];
+        
+        const result = await pool.query(query, values);
+        res.status(201).json({ mensaje: 'Corte guardado correctamente', id: result.rows[0].id });
+
+    } catch (err) {
+        console.error("ERROR EN CORTE:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 // ======================================================================
 // INICIO DEL SERVIDOR
