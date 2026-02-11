@@ -648,6 +648,81 @@ app.get('/api/debug/hora', async (req, res) => {
     } catch (err) { res.json({ error: err.message }); }
 });
 
+// ======================================================================
+// MÓDULO DE CORTE DE CAJA (ARQUEO)
+// ======================================================================
+
+// 1. Obtener Pre-Visualización del Corte (Calcula totales del día actual)
+app.get('/api/corte/preview', async (req, res) => {
+    try {
+        // Obtenemos la suma de ventas del día actual (Hermosillo), agrupadas por método de pago
+        // Solo contamos pedidos 'Entregado' para el flujo de caja
+        const query = `
+            SELECT metodo_pago, SUM(total) as total 
+            FROM Pedidos 
+            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date = (NOW() AT TIME ZONE 'America/Hermosillo')::date
+            AND estado = 'Entregado'
+            GROUP BY metodo_pago
+        `;
+        const result = await pool.query(query);
+        
+        // Formateamos la respuesta para que el frontend la lea fácil
+        const resumen = {
+            Efectivo: 0,
+            Tarjeta: 0,
+            Transferencia: 0,
+            Aplicación: 0
+        };
+
+        result.rows.forEach(row => {
+            const metodo = row.metodo_pago || 'Efectivo';
+            // Mapeo seguro por si el nombre en BD difiere ligeramente
+            if (metodo.includes('Aplicación')) resumen['Aplicación'] += parseFloat(row.total);
+            else if (metodo.includes('Tarjeta')) resumen['Tarjeta'] += parseFloat(row.total);
+            else if (metodo.includes('Transferencia')) resumen['Transferencia'] += parseFloat(row.total);
+            else resumen['Efectivo'] += parseFloat(row.total);
+        });
+
+        res.json(resumen);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 2. Guardar el Corte Definitivo
+app.post('/api/corte', async (req, res) => {
+    const { usuario, totales_esperados, totales_reales, observaciones } = req.body;
+    
+    // Calculamos totales generales
+    const total_ventas = Object.values(totales_esperados).reduce((a, b) => a + b, 0);
+    const total_real_fisico = totales_reales.efectivo + totales_reales.tarjeta; // Solo sumamos lo físico/vouchers
+    const total_esperado_fisico = totales_esperados.Efectivo + totales_esperados.Tarjeta;
+    
+    // Diferencia (Solo nos importa la diferencia en efectivo y tarjeta, las apps no se pueden "perder" en caja)
+    const diferencia = (totales_reales.efectivo - totales_esperados.Efectivo); 
+
+    try {
+        const query = `
+            INSERT INTO cortes_caja 
+            (usuario, total_ventas, esperado_efectivo, esperado_tarjeta, esperado_transferencia, esperado_apps, real_efectivo, real_tarjeta, diferencia, observaciones)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id, fecha_corte
+        `;
+        const values = [
+            usuario, total_ventas,
+            totales_esperados.Efectivo, totales_esperados.Tarjeta, totales_esperados.Transferencia, totales_esperados['Aplicación'],
+            totales_reales.efectivo, totales_reales.tarjeta,
+            diferencia, observaciones
+        ];
+        
+        const result = await pool.query(query, values);
+        res.status(201).json({ mensaje: 'Corte guardado correctamente', id: result.rows[0].id });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 // ======================================================================
 // INICIO DEL SERVIDOR
