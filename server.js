@@ -189,7 +189,7 @@ app.delete('/api/menu/opciones/grupo/:nombre', async (req, res) => {
 
 
 // ======================================================================
-// 5. INVENTARIO Y COMPRAS
+// 5. INVENTARIO Y COMPRAS (CORREGIDO CON PROVEEDORES)
 // ======================================================================
 
 // Listar Inventario (Filtros)
@@ -205,8 +205,10 @@ app.get('/api/inventario', async (req, res) => {
     }
     
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    
+    // CORRECCIÓN: Agregamos 'proveedor_preferido' a la selección
     const query = `
-        SELECT id, nombre, cantidad, unidad, stock_minimo, categoria, 
+        SELECT id, nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido,
         CASE WHEN cantidad <= 0 THEN 'Agotado' WHEN cantidad <= stock_minimo THEN 'Requiere re-stock' ELSE 'En stock' END AS estado
         FROM Insumos ${where} ORDER BY id;`;
 
@@ -218,20 +220,28 @@ app.get('/api/inventario', async (req, res) => {
 
 // Crear Insumo
 app.post('/api/inventario', async (req, res) => {
-    const { nombre, cantidad, unidad, stock_minimo, categoria } = req.body;
+    // CORRECCIÓN: Recibimos proveedor_preferido
+    const { nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido } = req.body;
     try {
-        const result = await pool.query('INSERT INTO Insumos (nombre, cantidad, unidad, stock_minimo, categoria) VALUES ($1, $2, $3, $4, $5) RETURNING *', 
-            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria]);
+        // CORRECCIÓN: Agregamos el campo al INSERT
+        const result = await pool.query(
+            'INSERT INTO Insumos (nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *', 
+            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, proveedor_preferido || 'General']
+        );
         res.status(201).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Editar Insumo
 app.put('/api/inventario/:id', async (req, res) => {
-    const { nombre, cantidad, unidad, stock_minimo, categoria } = req.body;
+    // CORRECCIÓN: Recibimos proveedor_preferido
+    const { nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido } = req.body;
     try {
-        const result = await pool.query('UPDATE Insumos SET nombre=$1, cantidad=$2, unidad=$3, stock_minimo=$4, categoria=$5 WHERE id=$6 RETURNING *',
-            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, req.params.id]);
+        // CORRECCIÓN: Agregamos el campo al UPDATE ($6)
+        const result = await pool.query(
+            'UPDATE Insumos SET nombre=$1, cantidad=$2, unidad=$3, stock_minimo=$4, categoria=$5, proveedor_preferido=$6 WHERE id=$7 RETURNING *',
+            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, proveedor_preferido || 'General', req.params.id]
+        );
         res.status(200).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -277,7 +287,6 @@ app.post('/api/compras', async (req, res) => {
                 const costo = parseFloat(insumo.rows[0].costo_promedio) || 0;
                 const nuevoStock = stock + parseFloat(cantidad);
                 let nuevoCosto = costo_unitario;
-                // Evitar división por cero
                 if (nuevoStock > 0) nuevoCosto = ((stock * costo) + (cantidad * costo_unitario)) / nuevoStock;
                 
                 await client.query('UPDATE insumos SET cantidad = $1, costo_promedio = $2 WHERE id = $3', [nuevoStock, nuevoCosto, insumo_id]);
