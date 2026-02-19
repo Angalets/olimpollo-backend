@@ -452,9 +452,34 @@ app.delete('/api/pedidos/:id', async (req, res) => {
 
 
 // ======================================================================
-// 7. CLIENTES (CRM - BÚSQUEDA)
+// 7. CLIENTES (CRM - BÚSQUEDA Y GESTIÓN)
 // ======================================================================
-app.get('/api/clientes/:telefono', async (req, res) => {
+
+// 7.1 Obtener todos los clientes o buscar por coincidencia
+app.get('/api/clientes', async (req, res) => {
+    const { buscar } = req.query;
+    try {
+        let query = 'SELECT id, nombre, telefono, visitas, total_gastado, puntos, ultima_visita FROM clientes';
+        let params = [];
+        
+        // Si hay texto en el buscador, filtramos por nombre o teléfono
+        if (buscar) {
+            query += ' WHERE nombre ILIKE $1 OR telefono LIKE $1';
+            params.push(`%${buscar}%`);
+        }
+        
+        // Ordenamos para ver primero a los que visitaron más recientemente
+        query += ' ORDER BY ultima_visita DESC NULLS LAST'; 
+        
+        const result = await pool.query(query, params);
+        res.status(200).json(result.rows);
+    } catch (err) { 
+        res.status(500).json({ error: err.message }); 
+    }
+});
+
+// 7.2 Búsqueda exacta por teléfono (Usado por el POS al cobrar)
+app.get('/api/clientes/exacto/:telefono', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM clientes WHERE telefono = $1', [req.params.telefono]);
         if (result.rows.length) res.json(result.rows[0]);
@@ -462,7 +487,17 @@ app.get('/api/clientes/:telefono', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-
+// 7.3 Actualizar el nombre del cliente
+app.put('/api/clientes/:id', async (req, res) => {
+    const { nombre } = req.body;
+    try {
+        const result = await pool.query('UPDATE clientes SET nombre = $1 WHERE id = $2 RETURNING *', [nombre, req.params.id]);
+        if (result.rows.length) res.status(200).json(result.rows[0]);
+        else res.status(404).json({ error: 'Cliente no encontrado' });
+    } catch (err) { 
+        res.status(500).json({ error: err.message }); 
+    }
+});
 // ======================================================================
 // 8. RECETAS (Endpoint Corregido)
 // ======================================================================
