@@ -911,6 +911,35 @@ app.post('/api/corte', async (req, res) => {
     }
 });
 
+// ======================================================================
+// 11. ALERTAS A COCINA (INTERCOMUNICADOR)
+// ======================================================================
+
+// Obtener alertas pendientes
+app.get('/api/alertas', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM alertas_cocina WHERE estado = 'Pendiente' ORDER BY fecha_creacion ASC");
+        res.status(200).json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Crear nueva alerta desde caja
+app.post('/api/alertas', async (req, res) => {
+    const { mensaje } = req.body;
+    try {
+        const result = await pool.query('INSERT INTO alertas_cocina (mensaje) VALUES ($1) RETURNING *', [mensaje]);
+        res.status(201).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Marcar alerta como completada desde cocina
+app.put('/api/alertas/:id', async (req, res) => {
+    try {
+        await pool.query("UPDATE alertas_cocina SET estado = 'Completada' WHERE id = $1", [req.params.id]);
+        res.status(200).json({ mensaje: 'Alerta completada' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 // ======================================================================
 // INICIO DEL SERVIDOR
