@@ -689,6 +689,39 @@ app.get('/api/reportes/ventas', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Ventas del Turno Actual (Desde el último corte de caja)
+app.get('/api/reportes/ventas-turno', async (req, res) => {
+    try {
+        // 1. Buscar la fecha y hora exacta del último corte
+        const ultimoCorteQuery = await pool.query('SELECT MAX(fecha_corte) as ultimo FROM cortes_caja');
+        const ultimoCorte = ultimoCorteQuery.rows[0].ultimo;
+
+        let query;
+        let params = [];
+
+        if (ultimoCorte) {
+            // Si hay un corte previo, sumamos todo a partir de ese segundo exacto
+            query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales 
+                     FROM Pedidos 
+                     WHERE fecha_creacion > $1 AND estado = 'Entregado'`;
+            params.push(ultimoCorte);
+        } else {
+            // Si por alguna razón es la primera vez que se usa el sistema y no hay cortes
+            query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales 
+                     FROM Pedidos 
+                     WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date = (NOW() AT TIME ZONE 'America/Hermosillo')::date 
+                     AND estado = 'Entregado'`;
+        }
+
+        const result = await pool.query(query, params);
+        res.status(200).json({
+            total_pedidos: parseInt(result.rows[0].total_pedidos || 0), 
+            ventas_totales: parseFloat(result.rows[0].ventas_totales || 0).toFixed(2),
+            comisiones: parseFloat(result.rows[0].comisiones_totales || 0).toFixed(2)
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Platillos Más Vendidos
 app.get('/api/reportes/platillos', async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
