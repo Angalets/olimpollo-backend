@@ -305,26 +305,23 @@ app.post('/api/compras', async (req, res) => {
 // 6. GESTIÓN DE PEDIDOS (CORE)
 // ======================================================================
 
-// GET: Lista de Pedidos con Filtros
 app.get('/api/pedidos', async (req, res) => {
-    // Limpieza automática de estados viejos
-    await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '1 hour'`);
+    await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '2 hours'`);
 
     const { canal, estado, fechaInicio, fechaFin } = req.query;
     let clauses = [], values = [], idx = 1;
 
     if (canal && canal !== 'Todos') { clauses.push(`p.canal_venta = $${idx++}`); values.push(canal); }
     if (estado) { clauses.push(`p.estado = $${idx++}`); values.push(estado); }
-    // Filtros de fecha con Zona Horaria Hermosillo
     if (fechaInicio) { clauses.push(`(p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $${idx++}`); values.push(fechaInicio); }
     if (fechaFin) { clauses.push(`(p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $${idx++}`); values.push(fechaFin); }
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     
-    // Consulta Actualizada: Trae comision y metodo_pago
     const query = `
-        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago,
+        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento,
         json_agg(json_build_object(
+            'menu_producto_id', pi.menu_producto_id,
             'nombre_producto', pi.nombre_producto, 
             'cantidad', pi.cantidad, 
             'precio_unitario', CAST(pi.precio_unitario AS TEXT),
@@ -340,52 +337,39 @@ app.get('/api/pedidos', async (req, res) => {
         const pedidos = result.rows.map(p => ({ 
             ...p, 
             total: parseFloat(p.total), 
-            comision: parseFloat(p.comision || 0), // Parseamos la comisión
+            comision: parseFloat(p.comision || 0), 
+            descuento: parseFloat(p.descuento || 0),
             items: p.items.map(i => ({ ...i, precio_unitario: parseFloat(i.precio_unitario) })) 
         }));
         res.status(200).json(pedidos);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// [POST] /api/pedidos - Crear Pedido (Con CRM, Notas y Comisiones de Tarjeta/Apps)
 app.post('/api/pedidos', async (req, res) => {
-    const { cliente, telefono, items, canal_venta, total_ajustado, metodo_pago } = req.body;
+    const { cliente, telefono, items, canal_venta, total_ajustado, metodo_pago, tipo_consumo, descuento } = req.body;
     if (!cliente || !items.length) return res.status(400).json({ error: 'Datos incompletos' });
 
-    const totalCalculado = items.reduce((sum, i) => sum + (i.cantidad * i.precio_unitario), 0);
-    const totalFinal = total_ajustado ?? totalCalculado;
-    
-    // --- LÓGICA DE COMISIÓN ACTUALIZADA ---
     let comision = 0;
-
-    if (metodo_pago === 'Tarjeta') {
-        // Tarjeta: 3.6% + IVA (16%) = 4.176%
-        comision = totalFinal * 0.04176;
-    } else if (metodo_pago === 'Aplicación') {
-        // Apps (Uber/Didi/Rappi): 42.13% (Promedio configurado)
-        comision = totalFinal * 0.4213;
-    }
+    if (metodo_pago === 'Tarjeta') comision = total_ajustado * 0.04176;
+    else if (metodo_pago === 'Aplicación') comision = total_ajustado * 0.4213;
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // 1. CRM: Gestión de Cliente
         if (telefono) {
             const existe = await client.query('SELECT id FROM clientes WHERE telefono = $1', [telefono]);
             if (existe.rows.length > 0) {
-                await client.query('UPDATE clientes SET visitas = visitas + 1, total_gastado = total_gastado + $1, ultima_visita = NOW(), nombre = $2 WHERE telefono = $3', [totalFinal, cliente, telefono]);
+                await client.query('UPDATE clientes SET visitas = visitas + 1, total_gastado = total_gastado + $1, ultima_visita = NOW(), nombre = $2 WHERE telefono = $3', [total_ajustado, cliente, telefono]);
             } else {
-                await client.query('INSERT INTO clientes (telefono, nombre, visitas, total_gastado, puntos) VALUES ($1, $2, 1, $3, 1)', [telefono, cliente, totalFinal]);
+                await client.query('INSERT INTO clientes (telefono, nombre, visitas, total_gastado, puntos) VALUES ($1, $2, 1, $3, 1)', [telefono, cliente, total_ajustado]);
             }
         }
 
-        // 2. Insertar Pedido (Incluyendo la comisión calculada)
-        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, comision) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
-            [cliente, totalFinal, canal_venta || 'OyR', metodo_pago || 'Efectivo', comision]);
+        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, comision, tipo_consumo, descuento) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id', 
+            [cliente, total_ajustado, canal_venta || 'OyR', metodo_pago || 'Efectivo', comision, tipo_consumo || 'Para Llevar', descuento || 0]);
         const pedidoId = pedRes.rows[0].id;
 
-        // 3. Insertar Items con Notas
         for (const item of items) {
             await client.query(`INSERT INTO pedido_items (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas) VALUES ($1, $2, $3, $4, $5, $6)`,
                 [pedidoId, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario, item.notas || '']);
@@ -395,24 +379,41 @@ app.post('/api/pedidos', async (req, res) => {
         res.status(201).json({ id: pedidoId, mensaje: 'Pedido guardado', comision: comision.toFixed(2) });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error(err);
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
 });
 
-// PUT: Cambiar Estado y Descontar Inventario
+// Endpoint Híbrido: Cambia de Estado O Edita el Pedido Completo
 app.put('/api/pedidos/:id', async (req, res) => {
-    const { estado } = req.body;
+    const { estado, items, cliente, total_ajustado, canal_venta, metodo_pago, tipo_consumo, descuento } = req.body;
     const client = await pool.connect();
+    
     try {
         await client.query('BEGIN');
         
-        // Si el pedido se entrega, descontamos inventario
-        if (estado === 'Entregado') {
-            const items = await client.query('SELECT menu_producto_id, nombre_producto, cantidad FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
+        // MODO 1: EDICIÓN COMPLETA DESDE EL POS
+        if (items && items.length > 0) {
+            let comision = 0;
+            if (metodo_pago === 'Tarjeta') comision = total_ajustado * 0.04176;
+            else if (metodo_pago === 'Aplicación') comision = total_ajustado * 0.4213;
+
+            await client.query(`UPDATE pedidos SET cliente=$1, total=$2, canal_venta=$3, metodo_pago=$4, comision=$5, tipo_consumo=$6, descuento=$7 WHERE id=$8`, 
+                [cliente, total_ajustado, canal_venta, metodo_pago, comision, tipo_consumo, descuento, req.params.id]);
+
+            await client.query('DELETE FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
             
-            for (const item of items.rows) {
-                // A. Descuento Receta Base
+            for (const item of items) {
+                await client.query(`INSERT INTO pedido_items (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas) VALUES ($1, $2, $3, $4, $5, $6)`,
+                    [req.params.id, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario, item.notas || '']);
+            }
+            await client.query('COMMIT');
+            return res.status(200).json({ mensaje: 'Pedido actualizado' });
+        }
+        
+        // MODO 2: SOLO CAMBIAR ESTADO A ENTREGADO (DESCUENTA INVENTARIO)
+        if (estado === 'Entregado') {
+            const dbItems = await client.query('SELECT menu_producto_id, nombre_producto, cantidad FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
+            for (const item of dbItems.rows) {
                 const prod = await client.query('SELECT receta_id FROM menu_productos WHERE id = $1', [item.menu_producto_id]);
                 if (prod.rows[0]?.receta_id) {
                     const insumos = await client.query('SELECT insumo_id, cantidad_necesaria FROM receta_insumo WHERE receta_id = $1', [prod.rows[0].receta_id]);
@@ -420,7 +421,6 @@ app.put('/api/pedidos/:id', async (req, res) => {
                         await client.query('UPDATE insumos SET cantidad = cantidad - $1 WHERE id = $2', [ins.cantidad_necesaria * item.cantidad, ins.insumo_id]);
                     }
                 }
-                // B. Descuento Modificadores (Strings entre paréntesis)
                 const match = item.nombre_producto.match(/\((.*)\)/);
                 if (match) {
                     const mods = match[1].split(',').map(m => m.trim());
@@ -442,7 +442,6 @@ app.put('/api/pedidos/:id', async (req, res) => {
     } finally { client.release(); }
 });
 
-// DELETE: Eliminar Pedido
 app.delete('/api/pedidos/:id', async (req, res) => {
     try {
         await pool.query('DELETE FROM Pedidos WHERE id = $1', [req.params.id]);
