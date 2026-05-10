@@ -318,8 +318,9 @@ app.get('/api/pedidos', async (req, res) => {
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     
+    // AÑADIDO: Seleccionamos la columna 'recompensa'
     const query = `
-        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento,
+        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento, p.recompensa,
         json_agg(json_build_object(
             'menu_producto_id', pi.menu_producto_id,
             'nombre_producto', pi.nombre_producto, 
@@ -357,17 +358,42 @@ app.post('/api/pedidos', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        let recompensa = false;
+
+        // LÓGICA DE VISITAS Y RECOMPENSAS
         if (telefono) {
-            const existe = await client.query('SELECT id FROM clientes WHERE telefono = $1', [telefono]);
-            if (existe.rows.length > 0) {
-                await client.query('UPDATE clientes SET visitas = visitas + 1, total_gastado = total_gastado + $1, ultima_visita = NOW(), nombre = $2 WHERE telefono = $3', [total_ajustado, cliente, telefono]);
+            const clienteRes = await client.query('SELECT id, visitas, ultima_visita FROM clientes WHERE telefono = $1', [telefono]);
+            
+            if (clienteRes.rows.length > 0) {
+                const c = clienteRes.rows[0];
+                
+                // Verificar si la última visita fue HOY en Hermosillo
+                const checkVisita = await client.query(`
+                    SELECT (ultima_visita AT TIME ZONE 'America/Hermosillo')::date = (NOW() AT TIME ZONE 'America/Hermosillo')::date AS misma_fecha 
+                    FROM clientes WHERE id = $1
+                `, [c.id]);
+
+                const mismaFecha = checkVisita.rows.length > 0 && checkVisita.rows[0].misma_fecha === true;
+
+                if (!mismaFecha) {
+                    // Es un día nuevo -> Sumamos 1 visita
+                    const nuevasVisitas = c.visitas + 1;
+                    if (nuevasVisitas % 8 === 0) recompensa = true; // Múltiplo de 8 = Cupón
+                    
+                    await client.query('UPDATE clientes SET visitas = $1, total_gastado = total_gastado + $2, ultima_visita = NOW(), nombre = $3 WHERE telefono = $4', [nuevasVisitas, total_ajustado, cliente, telefono]);
+                } else {
+                    // Es el mismo día -> Solo sumamos el dinero, NO la visita
+                    await client.query('UPDATE clientes SET total_gastado = total_gastado + $1, nombre = $2 WHERE telefono = $3', [total_ajustado, cliente, telefono]);
+                }
             } else {
-                await client.query('INSERT INTO clientes (telefono, nombre, visitas, total_gastado, puntos) VALUES ($1, $2, 1, $3, 1)', [telefono, cliente, total_ajustado]);
+                // Cliente Nuevo
+                await client.query('INSERT INTO clientes (telefono, nombre, visitas, total_gastado, puntos, ultima_visita) VALUES ($1, $2, 1, $3, 1, NOW())', [telefono, cliente, total_ajustado]);
             }
         }
 
-        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, comision, tipo_consumo, descuento) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id', 
-            [cliente, total_ajustado, canal_venta || 'OyR', metodo_pago || 'Efectivo', comision, tipo_consumo || 'Para Llevar', descuento || 0]);
+        // Guardar el Pedido (Ahora incluye si ganó recompensa)
+        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, comision, tipo_consumo, descuento, recompensa) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id', 
+            [cliente, total_ajustado, canal_venta || 'OyR', metodo_pago || 'Efectivo', comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa]);
         const pedidoId = pedRes.rows[0].id;
 
         for (const item of items) {
@@ -376,14 +402,15 @@ app.post('/api/pedidos', async (req, res) => {
         }
 
         await client.query('COMMIT');
-        res.status(201).json({ id: pedidoId, mensaje: 'Pedido guardado', comision: comision.toFixed(2) });
+        
+        // Devolvemos la variable recompensa para que el POS sepa si debe lanzar alerta
+        res.status(201).json({ id: pedidoId, mensaje: 'Pedido guardado', comision: comision.toFixed(2), recompensa });
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
 });
 
-// Endpoint Híbrido: Cambia de Estado O Edita el Pedido Completo
 app.put('/api/pedidos/:id', async (req, res) => {
     const { estado, items, cliente, total_ajustado, canal_venta, metodo_pago, tipo_consumo, descuento } = req.body;
     const client = await pool.connect();
@@ -391,7 +418,6 @@ app.put('/api/pedidos/:id', async (req, res) => {
     try {
         await client.query('BEGIN');
         
-        // MODO 1: EDICIÓN COMPLETA DESDE EL POS
         if (items && items.length > 0) {
             let comision = 0;
             if (metodo_pago === 'Tarjeta') comision = total_ajustado * 0.04176;
@@ -410,7 +436,6 @@ app.put('/api/pedidos/:id', async (req, res) => {
             return res.status(200).json({ mensaje: 'Pedido actualizado' });
         }
         
-        // MODO 2: SOLO CAMBIAR ESTADO A ENTREGADO (DESCUENTA INVENTARIO)
         if (estado === 'Entregado') {
             const dbItems = await client.query('SELECT menu_producto_id, nombre_producto, cantidad FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
             for (const item of dbItems.rows) {
