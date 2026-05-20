@@ -108,7 +108,8 @@ app.delete('/api/usuarios/:id', async (req, res) => {
 // Obtener Menú Completo para el POS (Estructura Anidada)
 app.get('/api/menu/pos', async (req, res) => {
     try {
-        const prodRes = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, grupos_modificadores FROM menu_productos ORDER BY categoria, nombre_venta');
+        // AÑADIDO: imagen_url
+        const prodRes = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, grupos_modificadores, imagen_url FROM menu_productos ORDER BY categoria, nombre_venta');
         const opRes = await pool.query('SELECT id, nombre_opcion, valor, CAST(precio_adicional AS TEXT) AS precio_adicional FROM menu_opciones ORDER BY nombre_opcion, valor');
 
         const opciones = opRes.rows.reduce((acc, op) => {
