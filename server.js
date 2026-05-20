@@ -127,25 +127,26 @@ app.get('/api/menu/pos', async (req, res) => {
 // CRUD Productos
 app.get('/api/menu/productos', async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id FROM menu_productos ORDER BY nombre_venta');
+        // Agregamos imagen_url a la consulta
+        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id, imagen_url FROM menu_productos ORDER BY nombre_venta');
         res.status(200).json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/menu/productos', async (req, res) => {
-    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores } = req.body;
+    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url } = req.body;
     try {
-        const result = await pool.query(`INSERT INTO menu_productos (nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, 
-            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '']);
+        const result = await pool.query(`INSERT INTO menu_productos (nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, 
+            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null]);
         res.status(201).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/menu/productos/:id', async (req, res) => {
-    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores } = req.body;
+    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url } = req.body;
     try {
-        const result = await pool.query(`UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6 WHERE id=$7 RETURNING *`, 
-            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', req.params.id]);
+        const result = await pool.query(`UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6, imagen_url=$7 WHERE id=$8 RETURNING *`, 
+            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null, req.params.id]);
         if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
         res.status(200).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
