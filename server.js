@@ -153,10 +153,23 @@ app.put('/api/menu/productos/:id', async (req, res) => {
 });
 
 app.delete('/api/menu/productos/:id', async (req, res) => {
+    const client = await pool.connect();
     try {
-        await pool.query('DELETE FROM menu_productos WHERE id = $1', [req.params.id]);
+        await client.query('BEGIN');
+        // 1. Desvinculamos el producto de los tickets históricos para no perder la contabilidad
+        await client.query('UPDATE pedido_items SET menu_producto_id = NULL WHERE menu_producto_id = $1', [req.params.id]);
+        
+        // 2. Ahora sí, borramos el platillo del menú permanentemente
+        await client.query('DELETE FROM menu_productos WHERE id = $1', [req.params.id]);
+        
+        await client.query('COMMIT');
         res.status(204).send();
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message }); 
+    } finally {
+        client.release();
+    }
 });
 
 // CRUD Opciones (Modificadores)
