@@ -124,28 +124,6 @@ app.get('/api/menu/pos', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// KPI
-app.get('/api/reportes/cogs', async (req, res) => {
-    const { fechaInicio, fechaFin } = req.query;
-    try {
-        const query = `
-            SELECT SUM(usage.cantidad_total * i.costo_promedio) as costo_total_insumos
-            FROM (
-                SELECT insumo_id, SUM(cantidad_necesaria) as cantidad_total
-                FROM receta_insumo ri
-                JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
-                JOIN pedidos p ON pi.pedido_id = p.id
-                WHERE p.estado = 'Entregado' 
-                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
-                GROUP BY insumo_id
-            ) usage
-            JOIN insumos i ON usage.insumo_id = i.id
-        `;
-        const result = await pool.query(query, [fechaInicio, fechaFin]);
-        res.json({ costo_total: parseFloat(result.rows[0].costo_total_insumos || 0) });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 // CRUD Productos
 app.get('/api/menu/productos', async (req, res) => {
     try {
@@ -628,6 +606,28 @@ app.delete('/api/recetas/:id', async (req, res) => {
 // ======================================================================
 // 9. REPORTES (ESTADÍSTICAS)
 // ======================================================================
+
+// KPI
+app.get('/api/reportes/cogs', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    try {
+        const query = `
+            SELECT SUM(usage.cantidad_total * i.costo_promedio) as costo_total_insumos
+            FROM (
+                SELECT insumo_id, SUM(cantidad_necesaria) as cantidad_total
+                FROM receta_insumo ri
+                JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+                JOIN pedidos p ON pi.pedido_id = p.id
+                WHERE p.estado = 'Entregado' 
+                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+                GROUP BY insumo_id
+            ) usage
+            JOIN insumos i ON usage.insumo_id = i.id
+        `;
+        const result = await pool.query(query, [fechaInicio, fechaFin]);
+        res.json({ costo_total: parseFloat(result.rows[0].costo_total_insumos || 0) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // REPORTE SEMANAL GERENCIAL (Ventas + Compras Sugeridas)
 app.get('/api/reportes/semanal', async (req, res) => {
