@@ -182,8 +182,11 @@ app.get('/api/menu/opciones', async (req, res) => {
 
 app.post('/api/menu/opciones', async (req, res) => {
     try {
-        const result = await pool.query('INSERT INTO menu_opciones (nombre_opcion, valor, precio_adicional) VALUES ($1, $2, $3) RETURNING *', 
-            [req.body.nombre_opcion, req.body.valor, parseFloat(req.body.precio_adicional) || 0]);
+        const { nombre_opcion, valor, precio_adicional, insumo_id, cantidad_insumo } = req.body;
+        const result = await pool.query(
+            'INSERT INTO menu_opciones (nombre_opcion, valor, precio_adicional, insumo_id, cantidad_insumo) VALUES ($1, $2, $3, $4, $5) RETURNING *', 
+            [nombre_opcion, valor, parseFloat(precio_adicional) || 0, insumo_id || null, parseFloat(cantidad_insumo) || 0]
+        );
         res.status(201).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
