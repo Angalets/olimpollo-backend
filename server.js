@@ -1037,6 +1037,91 @@ app.put('/api/alertas/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ======================================================================
+// 12. PRODUCCIÓN INTERNA (SUB-RECETAS)
+// ======================================================================
+
+// 1. Obtener todas las recetas de producción
+app.get('/api/produccion/recetas', async (req, res) => {
+    try {
+        const query = `
+            SELECT rp.id, rp.nombre, rp.insumo_resultado_id, i.nombre as nombre_resultado, rp.cantidad_resultado, i.unidad as unidad_resultado,
+            (SELECT json_agg(json_build_object('insumo_origen_id', pd.insumo_origen_id, 'nombre', io.nombre, 'cantidad_necesaria', CAST(pd.cantidad_necesaria AS TEXT), 'unidad', io.unidad))
+             FROM produccion_detalles pd JOIN insumos io ON pd.insumo_origen_id = io.id WHERE pd.receta_produccion_id = rp.id) as ingredientes
+            FROM recetas_produccion rp
+            JOIN insumos i ON rp.insumo_resultado_id = i.id
+            ORDER BY rp.nombre`;
+        const result = await pool.query(query);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 2. Crear una nueva receta de producción (Ej. "Tanda de Ranch")
+app.post('/api/produccion/recetas', async (req, res) => {
+    const { nombre, insumo_resultado_id, cantidad_resultado, ingredientes } = req.body;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const resReceta = await client.query(
+            'INSERT INTO recetas_produccion (nombre, insumo_resultado_id, cantidad_resultado) VALUES ($1, $2, $3) RETURNING id',
+            [nombre, insumo_resultado_id, cantidad_resultado]
+        );
+        const recetaId = resReceta.rows[0].id;
+        
+        for (const ing of ingredientes) {
+            await client.query(
+                'INSERT INTO produccion_detalles (receta_produccion_id, insumo_origen_id, cantidad_necesaria) VALUES ($1, $2, $3)',
+                [recetaId, ing.insumo_id, ing.cantidad]
+            );
+        }
+        await client.query('COMMIT');
+        res.status(201).json({ mensaje: 'Receta de producción creada' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
+});
+
+// 3. Eliminar receta de producción
+app.delete('/api/produccion/recetas/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM recetas_produccion WHERE id = $1', [req.params.id]);
+        res.status(204).send();
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 4. EJECUTAR PRODUCCIÓN (Resta insumos crudos, Suma producto final)
+app.post('/api/produccion/ejecutar', async (req, res) => {
+    const { receta_produccion_id, tandas } = req.body;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // A. Obtener receta y su resultado
+        const recetaRes = await client.query('SELECT insumo_resultado_id, cantidad_resultado FROM recetas_produccion WHERE id = $1', [receta_produccion_id]);
+        if (recetaRes.rows.length === 0) throw new Error("Receta no encontrada");
+        const receta = recetaRes.rows[0];
+
+        // B. Obtener ingredientes crudos requeridos
+        const ingredientesRes = await client.query('SELECT insumo_origen_id, cantidad_necesaria FROM produccion_detalles WHERE receta_produccion_id = $1', [receta_produccion_id]);
+        
+        // C. Descontar materia prima multiplicada por las "tandas"
+        for (const ing of ingredientesRes.rows) {
+            const aDescontar = parseFloat(ing.cantidad_necesaria) * parseFloat(tandas);
+            await client.query('UPDATE insumos SET cantidad = cantidad - $1 WHERE id = $2', [aDescontar, ing.insumo_origen_id]);
+        }
+
+        // D. Sumar el producto preparado al inventario
+        const aSumar = parseFloat(receta.cantidad_resultado) * parseFloat(tandas);
+        await client.query('UPDATE insumos SET cantidad = cantidad + $1 WHERE id = $2', [aSumar, receta.insumo_resultado_id]);
+
+        await client.query('COMMIT');
+        res.status(200).json({ mensaje: 'Producción registrada. Inventario actualizado exitosamente.' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
+});
 
 // ======================================================================
 // INICIO DEL SERVIDOR
