@@ -41,8 +41,36 @@ pool.query('SELECT NOW()', (err, res) => {
 // ======================================================================
 // 2. MIDDLEWARES
 // ======================================================================
-app.use(cors()); 
-app.use(bodyParser.json()); 
+app.use(cors());
+app.use(bodyParser.json());
+
+// Rutas que no requieren sesión (login y el menú público del QR digital)
+const RUTAS_PUBLICAS = [
+    { method: 'POST', path: '/api/login' },
+    { method: 'GET', path: '/api/menu/pos' },
+];
+
+function verifyToken(req, res, next) {
+    const esPublica = RUTAS_PUBLICAS.some(r => r.method === req.method && r.path === req.path);
+    if (esPublica) return next();
+
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Acceso denegado. Token requerido.' });
+
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+        if (err) return res.status(401).json({ error: 'Sesión inválida o expirada.' });
+        req.user = decoded;
+        next();
+    });
+}
+
+function requireAdmin(req, res, next) {
+    if (req.user?.rol !== 'Administrador') return res.status(403).json({ error: 'Acceso solo para Administradores.' });
+    next();
+}
+
+app.use(verifyToken);
 
 
 // ======================================================================
@@ -70,7 +98,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // Listar Usuarios
-app.get('/api/usuarios', async (req, res) => {
+app.get('/api/usuarios', requireAdmin, async (req, res) => {
     try {
         const result = await pool.query('SELECT id, username, rol FROM Usuarios ORDER BY id');
         res.status(200).json(result.rows);
@@ -78,7 +106,7 @@ app.get('/api/usuarios', async (req, res) => {
 });
 
 // Crear Usuario
-app.post('/api/usuarios', async (req, res) => {
+app.post('/api/usuarios', requireAdmin, async (req, res) => {
     const { username, password, rol } = req.body;
     try {
         const existing = await pool.query('SELECT id FROM Usuarios WHERE username = $1', [username]);
@@ -91,7 +119,7 @@ app.post('/api/usuarios', async (req, res) => {
 });
 
 // Eliminar Usuario
-app.delete('/api/usuarios/:id', async (req, res) => {
+app.delete('/api/usuarios/:id', requireAdmin, async (req, res) => {
     if (parseInt(req.params.id) === 1) return res.status(403).json({ error: 'No se puede eliminar al Super Admin.' });
     try {
         const result = await pool.query('DELETE FROM Usuarios WHERE id = $1 RETURNING id', [req.params.id]);
