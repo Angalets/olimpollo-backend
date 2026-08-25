@@ -118,6 +118,29 @@ app.post('/api/usuarios', requireAdmin, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Editar Usuario (rol y/o contraseña)
+app.put('/api/usuarios/:id', requireAdmin, async (req, res) => {
+    const { rol, password } = req.body;
+    if (!rol) return res.status(400).json({ error: 'El rol es obligatorio.' });
+    try {
+        let result;
+        if (password) {
+            const hash = await bcrypt.hash(password, 10);
+            result = await pool.query(
+                'UPDATE Usuarios SET rol = $1, password_hash = $2 WHERE id = $3 RETURNING id, username, rol',
+                [rol, hash, req.params.id]
+            );
+        } else {
+            result = await pool.query(
+                'UPDATE Usuarios SET rol = $1 WHERE id = $2 RETURNING id, username, rol',
+                [rol, req.params.id]
+            );
+        }
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Usuario no encontrado.' });
+        res.status(200).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Eliminar Usuario
 app.delete('/api/usuarios/:id', requireAdmin, async (req, res) => {
     if (parseInt(req.params.id) === 1) return res.status(403).json({ error: 'No se puede eliminar al Super Admin.' });
