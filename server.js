@@ -459,7 +459,7 @@ app.get('/api/pedidos', async (req, res) => {
 });
 
 app.post('/api/pedidos', async (req, res) => {
-    const { cliente, telefono, items, canal_venta, total_ajustado, tipo_consumo, descuento, propina, mesa_id } = req.body;
+    const { cliente, telefono, items, canal_venta, total_ajustado, tipo_consumo, descuento, propina, mesa_id, request_id } = req.body;
     if (!cliente || !items.length) return res.status(400).json({ error: 'Datos incompletos' });
 
     let pago;
@@ -474,6 +474,18 @@ app.post('/api/pedidos', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+
+        // Si el internet se cortó justo cuando el pedido ya se había guardado (pero antes de que la
+        // respuesta llegara al POS), un reintento automático trae el mismo request_id: devolvemos el
+        // pedido que ya existe en lugar de crear uno duplicado.
+        if (request_id) {
+            const existente = await client.query('SELECT id, comision, recompensa FROM pedidos WHERE request_id = $1', [request_id]);
+            if (existente.rows.length > 0) {
+                await client.query('ROLLBACK');
+                const row = existente.rows[0];
+                return res.status(201).json({ id: row.id, mensaje: 'Pedido guardado', comision: parseFloat(row.comision || 0).toFixed(2), recompensa: row.recompensa });
+            }
+        }
 
         if (mesa_id) {
             const ocupada = await client.query(
@@ -521,9 +533,9 @@ app.post('/api/pedidos', async (req, res) => {
 
         // Guardar el Pedido (Ahora incluye si ganó recompensa)
         const pedRes = await client.query(
-            `INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, metodo_pago_secundario, monto_efectivo, monto_no_efectivo, comision, tipo_consumo, descuento, recompensa, propina, mesa_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
-            [cliente, total_ajustado, canal_venta || 'OyR', pago.metodo_pago, pago.metodo_pago_secundario, pago.monto_efectivo, pago.monto_no_efectivo, comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa, propinaFinal, mesa_id || null]
+            `INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, metodo_pago_secundario, monto_efectivo, monto_no_efectivo, comision, tipo_consumo, descuento, recompensa, propina, mesa_id, request_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+            [cliente, total_ajustado, canal_venta || 'OyR', pago.metodo_pago, pago.metodo_pago_secundario, pago.monto_efectivo, pago.monto_no_efectivo, comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa, propinaFinal, mesa_id || null, request_id || null]
         );
         const pedidoId = pedRes.rows[0].id;
 
@@ -538,6 +550,18 @@ app.post('/api/pedidos', async (req, res) => {
         res.status(201).json({ id: pedidoId, mensaje: 'Pedido guardado', comision: comision.toFixed(2), recompensa });
     } catch (err) {
         await client.query('ROLLBACK');
+        // Dos reintentos casi simultáneos con el mismo request_id pueden pasar ambos la verificación
+        // de arriba antes de que cualquiera inserte; el índice único de la base de datos es el
+        // respaldo final contra el duplicado. Si eso es lo que pasó, devolvemos el pedido ya creado.
+        if (err.code === '23505' && request_id) {
+            try {
+                const existente = await pool.query('SELECT id, comision, recompensa FROM pedidos WHERE request_id = $1', [request_id]);
+                if (existente.rows.length > 0) {
+                    const row = existente.rows[0];
+                    return res.status(201).json({ id: row.id, mensaje: 'Pedido guardado', comision: parseFloat(row.comision || 0).toFixed(2), recompensa: row.recompensa });
+                }
+            } catch (e2) { /* si tampoco esto funciona, cae al 500 de abajo */ }
+        }
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
 });
