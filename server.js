@@ -352,10 +352,10 @@ app.post('/api/compras', async (req, res) => {
 // ======================================================================
 
 app.get('/api/pedidos', async (req, res) => {
-    await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND fecha_creacion < NOW() - INTERVAL '2 hours'`);
+    await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND eliminado = FALSE AND fecha_creacion < NOW() - INTERVAL '2 hours'`);
 
     const { canal, estado, fechaInicio, fechaFin } = req.query;
-    let clauses = [], values = [], idx = 1;
+    let clauses = ['p.eliminado = FALSE'], values = [], idx = 1;
 
     if (canal && canal !== 'Todos') { clauses.push(`p.canal_venta = $${idx++}`); values.push(canal); }
     if (estado) { clauses.push(`p.estado = $${idx++}`); values.push(estado); }
@@ -469,8 +469,8 @@ app.put('/api/pedidos/:id', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const actual = await client.query('SELECT estado FROM pedidos WHERE id = $1', [req.params.id]);
-        if (actual.rows.length === 0) {
+        const actual = await client.query('SELECT estado, eliminado FROM pedidos WHERE id = $1', [req.params.id]);
+        if (actual.rows.length === 0 || actual.rows[0].eliminado) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Pedido no encontrado.' });
         }
@@ -534,8 +534,8 @@ app.put('/api/pedidos/:id/cancelar', async (req, res) => {
     if (!motivo || !motivo.trim()) return res.status(400).json({ error: 'Se requiere un motivo para cancelar el pedido.' });
 
     try {
-        const actual = await pool.query('SELECT estado FROM pedidos WHERE id = $1', [req.params.id]);
-        if (actual.rows.length === 0) return res.status(404).json({ error: 'Pedido no encontrado.' });
+        const actual = await pool.query('SELECT estado, eliminado FROM pedidos WHERE id = $1', [req.params.id]);
+        if (actual.rows.length === 0 || actual.rows[0].eliminado) return res.status(404).json({ error: 'Pedido no encontrado.' });
         if (actual.rows[0].estado === 'Entregado' || actual.rows[0].estado === 'Cancelado') {
             return res.status(409).json({ error: `Este pedido ya está ${actual.rows[0].estado} y no se puede cancelar.` });
         }
@@ -548,9 +548,14 @@ app.put('/api/pedidos/:id/cancelar', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Borrado lógico: el registro se conserva para trazabilidad contable, solo se oculta de listas y reportes.
 app.delete('/api/pedidos/:id', async (req, res) => {
     try {
-        await pool.query('DELETE FROM Pedidos WHERE id = $1', [req.params.id]);
+        const result = await pool.query(
+            'UPDATE pedidos SET eliminado = TRUE, eliminado_por = $1, fecha_eliminacion = NOW() WHERE id = $2 AND eliminado = FALSE RETURNING id',
+            [req.user.username, req.params.id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Pedido no encontrado.' });
         res.status(204).send();
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -684,7 +689,7 @@ app.get('/api/reportes/cogs', async (req, res) => {
                 FROM receta_insumo ri
                 JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
                 JOIN pedidos p ON pi.pedido_id = p.id
-                WHERE p.estado = 'Entregado' 
+                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
                 AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
                 GROUP BY insumo_id
             ) usage
@@ -712,7 +717,7 @@ app.get('/api/reportes/semanal', async (req, res) => {
                 SUM(total) as venta_bruta,
                 SUM(comision) as comisiones
             FROM Pedidos
-            WHERE estado = 'Entregado'
+            WHERE estado = 'Entregado' AND eliminado = FALSE
             AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
             AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
             GROUP BY canal_venta, metodo_pago
@@ -802,10 +807,10 @@ app.get('/api/reportes/ventas', async (req, res) => {
     try {
         // Agregamos SUM(comision)
         const query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales 
-            FROM Pedidos 
-            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 
-            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2 
-            AND estado = 'Entregado'`;
+            FROM Pedidos
+            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+            AND estado = 'Entregado' AND eliminado = FALSE`;
         const result = await pool.query(query, [fechaInicio, fechaFin]);
         res.status(200).json({
             fechaInicio, fechaFin, 
@@ -828,16 +833,16 @@ app.get('/api/reportes/ventas-turno', async (req, res) => {
 
         if (ultimoCorte) {
             // Si hay un corte previo, sumamos todo a partir de ese segundo exacto
-            query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales 
-                     FROM Pedidos 
-                     WHERE fecha_creacion > $1 AND estado = 'Entregado'`;
+            query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales
+                     FROM Pedidos
+                     WHERE fecha_creacion > $1 AND estado = 'Entregado' AND eliminado = FALSE`;
             params.push(ultimoCorte);
         } else {
             // Si por alguna razón es la primera vez que se usa el sistema y no hay cortes
-            query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales 
-                     FROM Pedidos 
-                     WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date = (NOW() AT TIME ZONE 'America/Hermosillo')::date 
-                     AND estado = 'Entregado'`;
+            query = `SELECT COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales
+                     FROM Pedidos
+                     WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date = (NOW() AT TIME ZONE 'America/Hermosillo')::date
+                     AND estado = 'Entregado' AND eliminado = FALSE`;
         }
 
         const result = await pool.query(query, params);
@@ -855,7 +860,7 @@ app.get('/api/reportes/platillos', async (req, res) => {
     try {
         const query = `SELECT mp.nombre_venta AS producto, SUM(pi.cantidad) AS cantidad_vendida, SUM(pi.cantidad * pi.precio_unitario) AS ingreso_generado
             FROM pedido_items pi JOIN pedidos p ON pi.pedido_id = p.id JOIN menu_productos mp ON pi.menu_producto_id = mp.id
-            WHERE p.estado = 'Entregado' AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+            WHERE p.estado = 'Entregado' AND p.eliminado = FALSE AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
             GROUP BY mp.nombre_venta ORDER BY cantidad_vendida DESC`;
         const result = await pool.query(query, [fechaInicio, fechaFin]);
         res.status(200).json(result.rows);
@@ -884,8 +889,8 @@ app.get('/api/reportes/insumos-teoricos', async (req, res) => {
         const ventas = await client.query(`
             SELECT pi.menu_producto_id, pi.nombre_producto, pi.cantidad 
             FROM pedido_items pi JOIN pedidos p ON pi.pedido_id = p.id
-            WHERE p.estado = 'Entregado' 
-            AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1 
+            WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+            AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
             AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2`, [fechaInicio, fechaFin]);
 
         // 2. Obtener Recetas
@@ -973,9 +978,9 @@ app.get('/api/corte/preview', async (req, res) => {
             // CASO NORMAL: Traemos ventas registradas DESPUÉS del último corte
             // Esto cubre turnos de madrugada (ej: 5pm a 1am) y días inactivos (Domingo a Jueves)
             query = `
-                SELECT metodo_pago, SUM(total) as total 
-                FROM Pedidos 
-                WHERE estado = 'Entregado' 
+                SELECT metodo_pago, SUM(total) as total
+                FROM Pedidos
+                WHERE estado = 'Entregado' AND eliminado = FALSE
                 AND fecha_creacion > $1
                 GROUP BY metodo_pago
             `;
@@ -983,9 +988,9 @@ app.get('/api/corte/preview', async (req, res) => {
         } else {
             // CASO INICIAL: Si nunca se ha hecho un corte, traemos TODO lo histórico
             query = `
-                SELECT metodo_pago, SUM(total) as total 
-                FROM Pedidos 
-                WHERE estado = 'Entregado'
+                SELECT metodo_pago, SUM(total) as total
+                FROM Pedidos
+                WHERE estado = 'Entregado' AND eliminado = FALSE
                 GROUP BY metodo_pago
             `;
         }
