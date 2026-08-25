@@ -157,20 +157,48 @@ app.delete('/api/usuarios/:id', requireAdmin, async (req, res) => {
 // ======================================================================
 
 // Obtener Menú Completo para el POS (Estructura Anidada)
+// Trae los componentes de combo de todos los productos en una sola consulta y los agrupa
+// por menu_producto_id, para anidarlos en la respuesta sin hacer una query por producto.
+async function obtenerComponentesPorProducto(dbClient = pool) {
+    const res = await dbClient.query('SELECT id, menu_producto_id, nombre, orden, grupos_modificadores FROM combo_componentes ORDER BY menu_producto_id, orden, id');
+    return res.rows.reduce((acc, c) => {
+        if (!acc[c.menu_producto_id]) acc[c.menu_producto_id] = [];
+        acc[c.menu_producto_id].push(c);
+        return acc;
+    }, {});
+}
+
+// Reemplaza por completo los componentes de un producto (borra los existentes y
+// vuelve a insertar los que vengan en el body) — mismo patrón "borrar todo y
+// reinsertar" que ya se usa para pedido_items al editar un pedido.
+async function guardarComponentes(dbClient, menuProductoId, componentes) {
+    await dbClient.query('DELETE FROM combo_componentes WHERE menu_producto_id = $1', [menuProductoId]);
+    if (!Array.isArray(componentes)) return;
+    for (let i = 0; i < componentes.length; i++) {
+        const c = componentes[i];
+        if (!c.nombre || !c.nombre.trim()) continue;
+        await dbClient.query(
+            'INSERT INTO combo_componentes (menu_producto_id, nombre, orden, grupos_modificadores) VALUES ($1, $2, $3, $4)',
+            [menuProductoId, c.nombre.trim(), i, c.grupos_modificadores || '']
+        );
+    }
+}
+
 app.get('/api/menu/pos', async (req, res) => {
     try {
         // AÑADIDO: imagen_url
         const prodRes = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, grupos_modificadores, imagen_url FROM menu_productos ORDER BY categoria, nombre_venta');
         const opRes = await pool.query('SELECT id, nombre_opcion, valor, CAST(precio_adicional AS TEXT) AS precio_adicional FROM menu_opciones ORDER BY nombre_opcion, valor');
+        const componentesPorProducto = await obtenerComponentesPorProducto();
 
         const opciones = opRes.rows.reduce((acc, op) => {
             if (!acc[op.nombre_opcion]) acc[op.nombre_opcion] = [];
-            op.precio_adicional = parseFloat(op.precio_adicional); 
+            op.precio_adicional = parseFloat(op.precio_adicional);
             acc[op.nombre_opcion].push(op);
             return acc;
         }, {});
 
-        const productos = prodRes.rows.map(p => ({ ...p, precio_base: parseFloat(p.precio_base) }));
+        const productos = prodRes.rows.map(p => ({ ...p, precio_base: parseFloat(p.precio_base), componentes: componentesPorProducto[p.id] || [] }));
         res.status(200).json({ productos, opciones });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -179,28 +207,44 @@ app.get('/api/menu/pos', async (req, res) => {
 app.get('/api/menu/productos', async (req, res) => {
     try {
         // Agregamos imagen_url a la consulta
-        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id, imagen_url FROM menu_productos ORDER BY nombre_venta');
-        res.status(200).json(result.rows);
+        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id, imagen_url, grupos_modificadores FROM menu_productos ORDER BY nombre_venta');
+        const componentesPorProducto = await obtenerComponentesPorProducto();
+        const productos = result.rows.map(p => ({ ...p, componentes: componentesPorProducto[p.id] || [] }));
+        res.status(200).json(productos);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/menu/productos', async (req, res) => {
-    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url } = req.body;
+    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, componentes } = req.body;
+    const client = await pool.connect();
     try {
-        const result = await pool.query(`INSERT INTO menu_productos (nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, 
+        await client.query('BEGIN');
+        const result = await client.query(`INSERT INTO menu_productos (nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
             [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null]);
+        await guardarComponentes(client, result.rows[0].id, componentes);
+        await client.query('COMMIT');
         res.status(201).json(result.rows[0]);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
 });
 
 app.put('/api/menu/productos/:id', async (req, res) => {
-    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url } = req.body;
+    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, componentes } = req.body;
+    const client = await pool.connect();
     try {
-        const result = await pool.query(`UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6, imagen_url=$7 WHERE id=$8 RETURNING *`, 
+        await client.query('BEGIN');
+        const result = await client.query(`UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6, imagen_url=$7 WHERE id=$8 RETURNING *`,
             [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null, req.params.id]);
-        if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
+        if (result.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No encontrado' }); }
+        await guardarComponentes(client, req.params.id, componentes);
+        await client.query('COMMIT');
         res.status(200).json(result.rows[0]);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
 });
 
 app.delete('/api/menu/productos/:id', async (req, res) => {
@@ -435,7 +479,8 @@ app.get('/api/pedidos', async (req, res) => {
             'nombre_producto', pi.nombre_producto, 
             'cantidad', pi.cantidad, 
             'precio_unitario', CAST(pi.precio_unitario AS TEXT),
-            'notas', pi.notas 
+            'notas', pi.notas,
+            'detalle_componentes', pi.detalle_componentes
         )) AS items 
         FROM pedidos p 
         JOIN pedido_items pi ON p.id = pi.pedido_id 
@@ -540,8 +585,8 @@ app.post('/api/pedidos', async (req, res) => {
         const pedidoId = pedRes.rows[0].id;
 
         for (const item of items) {
-            await client.query(`INSERT INTO pedido_items (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas) VALUES ($1, $2, $3, $4, $5, $6)`,
-                [pedidoId, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario, item.notas || '']);
+            await client.query(`INSERT INTO pedido_items (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas, detalle_componentes) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [pedidoId, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario, item.notas || '', item.detalle_componentes || null]);
         }
 
         await client.query('COMMIT');
@@ -608,8 +653,8 @@ app.put('/api/pedidos/:id', async (req, res) => {
             await client.query('DELETE FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
             
             for (const item of items) {
-                await client.query(`INSERT INTO pedido_items (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas) VALUES ($1, $2, $3, $4, $5, $6)`,
-                    [req.params.id, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario, item.notas || '']);
+                await client.query(`INSERT INTO pedido_items (pedido_id, menu_producto_id, nombre_producto, cantidad, precio_unitario, notas, detalle_componentes) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                    [req.params.id, item.menu_producto_id, item.nombre_producto_completo, item.cantidad, item.precio_unitario, item.notas || '', item.detalle_componentes || null]);
             }
             await client.query('COMMIT');
             return res.status(200).json({ mensaje: 'Pedido actualizado' });
