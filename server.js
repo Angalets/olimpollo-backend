@@ -47,7 +47,7 @@ app.use(bodyParser.json());
 // Rutas que no requieren sesión (login y el menú público del QR digital)
 const RUTAS_PUBLICAS = [
     { method: 'POST', path: '/api/login' },
-    { method: 'GET', path: '/api/menu/pos' },
+    { method: 'GET', path: '/api/menu/digital' },
 ];
 
 function verifyToken(req, res, next) {
@@ -187,7 +187,28 @@ async function guardarComponentes(dbClient, menuProductoId, componentes) {
 app.get('/api/menu/pos', async (req, res) => {
     try {
         // AÑADIDO: imagen_url
-        const prodRes = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, grupos_modificadores, imagen_url FROM menu_productos ORDER BY categoria, nombre_venta');
+        const prodRes = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, grupos_modificadores, imagen_url, visible_menu FROM menu_productos ORDER BY categoria, nombre_venta');
+        const opRes = await pool.query('SELECT id, nombre_opcion, valor, CAST(precio_adicional AS TEXT) AS precio_adicional FROM menu_opciones ORDER BY nombre_opcion, valor');
+        const componentesPorProducto = await obtenerComponentesPorProducto();
+
+        const opciones = opRes.rows.reduce((acc, op) => {
+            if (!acc[op.nombre_opcion]) acc[op.nombre_opcion] = [];
+            op.precio_adicional = parseFloat(op.precio_adicional);
+            acc[op.nombre_opcion].push(op);
+            return acc;
+        }, {});
+
+        const productos = prodRes.rows.map(p => ({ ...p, precio_base: parseFloat(p.precio_base), componentes: componentesPorProducto[p.id] || [] }));
+        res.status(200).json({ productos, opciones });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Menú público para el QR del menú digital — mismo shape que /api/menu/pos, pero
+// solo productos con visible_menu = TRUE (algunos platillos del POS son de uso
+// interno y no deben aparecer aquí). Sin autenticación: lo consultan los clientes.
+app.get('/api/menu/digital', async (req, res) => {
+    try {
+        const prodRes = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, grupos_modificadores, imagen_url, descripcion FROM menu_productos WHERE visible_menu = TRUE ORDER BY categoria, nombre_venta');
         const opRes = await pool.query('SELECT id, nombre_opcion, valor, CAST(precio_adicional AS TEXT) AS precio_adicional FROM menu_opciones ORDER BY nombre_opcion, valor');
         const componentesPorProducto = await obtenerComponentesPorProducto();
 
@@ -207,7 +228,7 @@ app.get('/api/menu/pos', async (req, res) => {
 app.get('/api/menu/productos', async (req, res) => {
     try {
         // Agregamos imagen_url a la consulta
-        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id, imagen_url, grupos_modificadores FROM menu_productos ORDER BY nombre_venta');
+        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id, imagen_url, grupos_modificadores, visible_menu FROM menu_productos ORDER BY nombre_venta');
         const componentesPorProducto = await obtenerComponentesPorProducto();
         const productos = result.rows.map(p => ({ ...p, componentes: componentesPorProducto[p.id] || [] }));
         res.status(200).json(productos);
@@ -215,12 +236,12 @@ app.get('/api/menu/productos', async (req, res) => {
 });
 
 app.post('/api/menu/productos', async (req, res) => {
-    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, componentes } = req.body;
+    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, componentes, visible_menu } = req.body;
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const result = await client.query(`INSERT INTO menu_productos (nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null]);
+        const result = await client.query(`INSERT INTO menu_productos (nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, visible_menu) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null, visible_menu !== false]);
         await guardarComponentes(client, result.rows[0].id, componentes);
         await client.query('COMMIT');
         res.status(201).json(result.rows[0]);
@@ -231,12 +252,12 @@ app.post('/api/menu/productos', async (req, res) => {
 });
 
 app.put('/api/menu/productos/:id', async (req, res) => {
-    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, componentes } = req.body;
+    const { nombre_venta, precio_base, categoria, receta_id, descripcion, grupos_modificadores, imagen_url, componentes, visible_menu } = req.body;
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const result = await client.query(`UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6, imagen_url=$7 WHERE id=$8 RETURNING *`,
-            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null, req.params.id]);
+        const result = await client.query(`UPDATE menu_productos SET nombre_venta=$1, precio_base=$2, categoria=$3, receta_id=$4, descripcion=$5, grupos_modificadores=$6, imagen_url=$7, visible_menu=$8 WHERE id=$9 RETURNING *`,
+            [nombre_venta, parseFloat(precio_base), categoria, receta_id || null, descripcion, grupos_modificadores || '', imagen_url || null, visible_menu !== false, req.params.id]);
         if (result.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No encontrado' }); }
         await guardarComponentes(client, req.params.id, componentes);
         await client.query('COMMIT');
