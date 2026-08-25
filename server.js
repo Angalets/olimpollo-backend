@@ -416,9 +416,10 @@ function resolverPago(body, total_ajustado) {
 app.get('/api/pedidos', async (req, res) => {
     await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND eliminado = FALSE AND fecha_creacion < NOW() - INTERVAL '2 hours'`);
 
-    const { canal, estado, fechaInicio, fechaFin } = req.query;
+    const { canal, estado, fechaInicio, fechaFin, id } = req.query;
     let clauses = ['p.eliminado = FALSE'], values = [], idx = 1;
 
+    if (id) { clauses.push(`p.id = $${idx++}`); values.push(id); }
     if (canal && canal !== 'Todos') { clauses.push(`p.canal_venta = $${idx++}`); values.push(canal); }
     if (estado) { clauses.push(`p.estado = $${idx++}`); values.push(estado); }
     if (fechaInicio) { clauses.push(`(p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $${idx++}`); values.push(fechaInicio); }
@@ -458,7 +459,7 @@ app.get('/api/pedidos', async (req, res) => {
 });
 
 app.post('/api/pedidos', async (req, res) => {
-    const { cliente, telefono, items, canal_venta, total_ajustado, tipo_consumo, descuento, propina } = req.body;
+    const { cliente, telefono, items, canal_venta, total_ajustado, tipo_consumo, descuento, propina, mesa_id } = req.body;
     if (!cliente || !items.length) return res.status(400).json({ error: 'Datos incompletos' });
 
     let pago;
@@ -473,6 +474,17 @@ app.post('/api/pedidos', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+
+        if (mesa_id) {
+            const ocupada = await client.query(
+                `SELECT id FROM pedidos WHERE mesa_id = $1 AND estado IN ('Pendiente', 'Listo') AND eliminado = FALSE`,
+                [mesa_id]
+            );
+            if (ocupada.rows.length > 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: 'Esa mesa ya tiene un pedido abierto.', pedido_id: ocupada.rows[0].id });
+            }
+        }
 
         let recompensa = false;
 
@@ -509,9 +521,9 @@ app.post('/api/pedidos', async (req, res) => {
 
         // Guardar el Pedido (Ahora incluye si ganó recompensa)
         const pedRes = await client.query(
-            `INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, metodo_pago_secundario, monto_efectivo, monto_no_efectivo, comision, tipo_consumo, descuento, recompensa, propina)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
-            [cliente, total_ajustado, canal_venta || 'OyR', pago.metodo_pago, pago.metodo_pago_secundario, pago.monto_efectivo, pago.monto_no_efectivo, comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa, propinaFinal]
+            `INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, metodo_pago_secundario, monto_efectivo, monto_no_efectivo, comision, tipo_consumo, descuento, recompensa, propina, mesa_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+            [cliente, total_ajustado, canal_venta || 'OyR', pago.metodo_pago, pago.metodo_pago_secundario, pago.monto_efectivo, pago.monto_no_efectivo, comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa, propinaFinal, mesa_id || null]
         );
         const pedidoId = pedRes.rows[0].id;
 
@@ -638,6 +650,62 @@ app.delete('/api/pedidos/:id', async (req, res) => {
             [req.user.username, req.params.id]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'Pedido no encontrado.' });
+        res.status(204).send();
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ======================================================================
+// 6.1 MAPA DE MESAS
+// ======================================================================
+
+// Listar mesas activas con su ocupación actual (cualquier usuario autenticado la puede ver)
+app.get('/api/mesas', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT m.id, m.nombre, p.id AS pedido_id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, p.fecha_creacion
+            FROM mesas m
+            LEFT JOIN pedidos p ON p.mesa_id = m.id AND p.estado IN ('Pendiente', 'Listo') AND p.eliminado = FALSE
+            WHERE m.activa = TRUE
+            ORDER BY m.id
+        `);
+        const mesas = result.rows.map(m => ({ ...m, total: m.total !== null ? parseFloat(m.total) : null }));
+        res.status(200).json(mesas);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Crear mesa
+app.post('/api/mesas', requireAdmin, async (req, res) => {
+    const { nombre } = req.body;
+    if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre de la mesa es obligatorio.' });
+    try {
+        const result = await pool.query('INSERT INTO mesas (nombre) VALUES ($1) RETURNING id, nombre', [nombre.trim()]);
+        res.status(201).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Renombrar mesa
+app.put('/api/mesas/:id', requireAdmin, async (req, res) => {
+    const { nombre } = req.body;
+    if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre de la mesa es obligatorio.' });
+    try {
+        const result = await pool.query('UPDATE mesas SET nombre = $1 WHERE id = $2 AND activa = TRUE RETURNING id, nombre', [nombre.trim(), req.params.id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Mesa no encontrada.' });
+        res.status(200).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Dar de baja una mesa (no se puede si tiene un pedido abierto)
+app.delete('/api/mesas/:id', requireAdmin, async (req, res) => {
+    try {
+        const ocupada = await pool.query(
+            `SELECT id FROM pedidos WHERE mesa_id = $1 AND estado IN ('Pendiente', 'Listo') AND eliminado = FALSE`,
+            [req.params.id]
+        );
+        if (ocupada.rows.length > 0) return res.status(409).json({ error: 'No se puede quitar una mesa con un pedido abierto.' });
+
+        const result = await pool.query('UPDATE mesas SET activa = FALSE WHERE id = $1 AND activa = TRUE RETURNING id', [req.params.id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Mesa no encontrada.' });
         res.status(204).send();
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
