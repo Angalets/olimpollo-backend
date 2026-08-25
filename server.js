@@ -366,7 +366,7 @@ app.get('/api/pedidos', async (req, res) => {
     
     // AÑADIDO: Seleccionamos la columna 'recompensa'
     const query = `
-        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento, p.recompensa,
+        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento, p.recompensa, p.motivo_cancelacion, p.cancelado_por, p.fecha_cancelacion,
         json_agg(json_build_object(
             'menu_producto_id', pi.menu_producto_id,
             'nombre_producto', pi.nombre_producto, 
@@ -459,11 +459,26 @@ app.post('/api/pedidos', async (req, res) => {
 
 app.put('/api/pedidos/:id', async (req, res) => {
     const { estado, items, cliente, total_ajustado, canal_venta, metodo_pago, tipo_consumo, descuento } = req.body;
+
+    if (estado === 'Cancelado') {
+        return res.status(400).json({ error: 'Usa PUT /api/pedidos/:id/cancelar para cancelar un pedido (requiere motivo).' });
+    }
+
     const client = await pool.connect();
-    
+
     try {
         await client.query('BEGIN');
-        
+
+        const actual = await client.query('SELECT estado FROM pedidos WHERE id = $1', [req.params.id]);
+        if (actual.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Pedido no encontrado.' });
+        }
+        if (actual.rows[0].estado === 'Entregado' || actual.rows[0].estado === 'Cancelado') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Este pedido ya está ${actual.rows[0].estado} y no se puede modificar.` });
+        }
+
         if (items && items.length > 0) {
             let comision = 0;
             if (metodo_pago === 'Tarjeta') comision = total_ajustado * 0.04176;
@@ -511,6 +526,26 @@ app.put('/api/pedidos/:id', async (req, res) => {
         await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
+});
+
+// Cancelar pedido (requiere motivo; queda registrado quién y cuándo)
+app.put('/api/pedidos/:id/cancelar', async (req, res) => {
+    const { motivo } = req.body;
+    if (!motivo || !motivo.trim()) return res.status(400).json({ error: 'Se requiere un motivo para cancelar el pedido.' });
+
+    try {
+        const actual = await pool.query('SELECT estado FROM pedidos WHERE id = $1', [req.params.id]);
+        if (actual.rows.length === 0) return res.status(404).json({ error: 'Pedido no encontrado.' });
+        if (actual.rows[0].estado === 'Entregado' || actual.rows[0].estado === 'Cancelado') {
+            return res.status(409).json({ error: `Este pedido ya está ${actual.rows[0].estado} y no se puede cancelar.` });
+        }
+
+        await pool.query(
+            'UPDATE pedidos SET estado = $1, motivo_cancelacion = $2, cancelado_por = $3, fecha_cancelacion = NOW() WHERE id = $4',
+            ['Cancelado', motivo.trim(), req.user.username, req.params.id]
+        );
+        res.status(200).json({ mensaje: 'Pedido cancelado.' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/pedidos/:id', async (req, res) => {
