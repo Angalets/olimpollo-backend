@@ -351,6 +351,45 @@ app.post('/api/compras', async (req, res) => {
 // 6. GESTIÓN DE PEDIDOS (CORE)
 // ======================================================================
 
+const TASA_COMISION = { 'Tarjeta': 0.04176, 'Aplicación': 0.4213 };
+
+// Resuelve método de pago + comisión a partir del body de POST/PUT /api/pedidos.
+// Para pago mixto (Efectivo + un método más) valida que los montos cuadren con el total
+// y calcula la comisión solo sobre la parte no-efectivo. Lanza Error en datos inválidos.
+function resolverPago(body, total_ajustado) {
+    const { metodo_pago, metodo_pago_secundario, monto_efectivo, monto_no_efectivo } = body;
+
+    if (metodo_pago === 'Mixto') {
+        if (!metodo_pago_secundario || metodo_pago_secundario === 'Efectivo') {
+            throw new Error('Para un pago mixto indica un método secundario distinto de Efectivo.');
+        }
+        const efectivo = parseFloat(monto_efectivo);
+        const noEfectivo = parseFloat(monto_no_efectivo);
+        if (isNaN(efectivo) || isNaN(noEfectivo) || efectivo < 0 || noEfectivo < 0) {
+            throw new Error('Montos de pago mixto inválidos.');
+        }
+        if (Math.abs((efectivo + noEfectivo) - total_ajustado) > 0.01) {
+            throw new Error('La suma del pago mixto no coincide con el total del pedido.');
+        }
+        return {
+            metodo_pago: 'Mixto',
+            metodo_pago_secundario,
+            monto_efectivo: efectivo,
+            monto_no_efectivo: noEfectivo,
+            comision: (TASA_COMISION[metodo_pago_secundario] || 0) * noEfectivo
+        };
+    }
+
+    const metodo = metodo_pago || 'Efectivo';
+    return {
+        metodo_pago: metodo,
+        metodo_pago_secundario: null,
+        monto_efectivo: null,
+        monto_no_efectivo: null,
+        comision: (TASA_COMISION[metodo] || 0) * total_ajustado
+    };
+}
+
 app.get('/api/pedidos', async (req, res) => {
     await pool.query(`UPDATE pedidos SET estado = 'Entregado' WHERE estado = 'Pendiente' AND eliminado = FALSE AND fecha_creacion < NOW() - INTERVAL '2 hours'`);
 
@@ -366,7 +405,7 @@ app.get('/api/pedidos', async (req, res) => {
     
     // AÑADIDO: Seleccionamos la columna 'recompensa'
     const query = `
-        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento, p.recompensa, p.motivo_cancelacion, p.cancelado_por, p.fecha_cancelacion,
+        SELECT p.id, p.cliente, p.estado, CAST(p.total AS TEXT) AS total, CAST(p.comision AS TEXT) AS comision, p.fecha_creacion, p.canal_venta, p.metodo_pago, p.metodo_pago_secundario, CAST(p.monto_efectivo AS TEXT) AS monto_efectivo, CAST(p.monto_no_efectivo AS TEXT) AS monto_no_efectivo, CAST(p.propina AS TEXT) AS propina, p.tipo_consumo, CAST(p.descuento AS TEXT) AS descuento, p.recompensa, p.motivo_cancelacion, p.cancelado_por, p.fecha_cancelacion,
         json_agg(json_build_object(
             'menu_producto_id', pi.menu_producto_id,
             'nombre_producto', pi.nombre_producto, 
@@ -381,24 +420,32 @@ app.get('/api/pedidos', async (req, res) => {
 
     try {
         const result = await pool.query(query, values);
-        const pedidos = result.rows.map(p => ({ 
-            ...p, 
-            total: parseFloat(p.total), 
-            comision: parseFloat(p.comision || 0), 
+        const pedidos = result.rows.map(p => ({
+            ...p,
+            total: parseFloat(p.total),
+            comision: parseFloat(p.comision || 0),
             descuento: parseFloat(p.descuento || 0),
-            items: p.items.map(i => ({ ...i, precio_unitario: parseFloat(i.precio_unitario) })) 
+            propina: parseFloat(p.propina || 0),
+            monto_efectivo: p.monto_efectivo !== null ? parseFloat(p.monto_efectivo) : null,
+            monto_no_efectivo: p.monto_no_efectivo !== null ? parseFloat(p.monto_no_efectivo) : null,
+            items: p.items.map(i => ({ ...i, precio_unitario: parseFloat(i.precio_unitario) }))
         }));
         res.status(200).json(pedidos);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/pedidos', async (req, res) => {
-    const { cliente, telefono, items, canal_venta, total_ajustado, metodo_pago, tipo_consumo, descuento } = req.body;
+    const { cliente, telefono, items, canal_venta, total_ajustado, tipo_consumo, descuento, propina } = req.body;
     if (!cliente || !items.length) return res.status(400).json({ error: 'Datos incompletos' });
 
-    let comision = 0;
-    if (metodo_pago === 'Tarjeta') comision = total_ajustado * 0.04176;
-    else if (metodo_pago === 'Aplicación') comision = total_ajustado * 0.4213;
+    let pago;
+    try {
+        pago = resolverPago(req.body, total_ajustado);
+    } catch (err) {
+        return res.status(400).json({ error: err.message });
+    }
+    const comision = pago.comision;
+    const propinaFinal = parseFloat(propina) || 0;
 
     const client = await pool.connect();
     try {
@@ -438,8 +485,11 @@ app.post('/api/pedidos', async (req, res) => {
         }
 
         // Guardar el Pedido (Ahora incluye si ganó recompensa)
-        const pedRes = await client.query('INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, comision, tipo_consumo, descuento, recompensa) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id', 
-            [cliente, total_ajustado, canal_venta || 'OyR', metodo_pago || 'Efectivo', comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa]);
+        const pedRes = await client.query(
+            `INSERT INTO pedidos (cliente, total, canal_venta, metodo_pago, metodo_pago_secundario, monto_efectivo, monto_no_efectivo, comision, tipo_consumo, descuento, recompensa, propina)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+            [cliente, total_ajustado, canal_venta || 'OyR', pago.metodo_pago, pago.metodo_pago_secundario, pago.monto_efectivo, pago.monto_no_efectivo, comision, tipo_consumo || 'Para Llevar', descuento || 0, recompensa, propinaFinal]
+        );
         const pedidoId = pedRes.rows[0].id;
 
         for (const item of items) {
@@ -458,10 +508,19 @@ app.post('/api/pedidos', async (req, res) => {
 });
 
 app.put('/api/pedidos/:id', async (req, res) => {
-    const { estado, items, cliente, total_ajustado, canal_venta, metodo_pago, tipo_consumo, descuento } = req.body;
+    const { estado, items, cliente, total_ajustado, canal_venta, tipo_consumo, descuento, propina } = req.body;
 
     if (estado === 'Cancelado') {
         return res.status(400).json({ error: 'Usa PUT /api/pedidos/:id/cancelar para cancelar un pedido (requiere motivo).' });
+    }
+
+    let pago = null;
+    if (items && items.length > 0) {
+        try {
+            pago = resolverPago(req.body, total_ajustado);
+        } catch (err) {
+            return res.status(400).json({ error: err.message });
+        }
     }
 
     const client = await pool.connect();
@@ -480,12 +539,12 @@ app.put('/api/pedidos/:id', async (req, res) => {
         }
 
         if (items && items.length > 0) {
-            let comision = 0;
-            if (metodo_pago === 'Tarjeta') comision = total_ajustado * 0.04176;
-            else if (metodo_pago === 'Aplicación') comision = total_ajustado * 0.4213;
+            const propinaFinal = parseFloat(propina) || 0;
 
-            await client.query(`UPDATE pedidos SET cliente=$1, total=$2, canal_venta=$3, metodo_pago=$4, comision=$5, tipo_consumo=$6, descuento=$7 WHERE id=$8`, 
-                [cliente, total_ajustado, canal_venta, metodo_pago, comision, tipo_consumo, descuento, req.params.id]);
+            await client.query(
+                `UPDATE pedidos SET cliente=$1, total=$2, canal_venta=$3, metodo_pago=$4, metodo_pago_secundario=$5, monto_efectivo=$6, monto_no_efectivo=$7, comision=$8, tipo_consumo=$9, descuento=$10, propina=$11 WHERE id=$12`,
+                [cliente, total_ajustado, canal_venta, pago.metodo_pago, pago.metodo_pago_secundario, pago.monto_efectivo, pago.monto_no_efectivo, pago.comision, tipo_consumo, descuento, propinaFinal, req.params.id]
+            );
 
             await client.query('DELETE FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
             
@@ -970,22 +1029,41 @@ async function calcularVentasDesdeUltimoCorte(client) {
     const ultimoCorteQuery = await client.query('SELECT MAX(fecha_corte) as ultimo FROM cortes_caja');
     const ultimoCorte = ultimoCorteQuery.rows[0].ultimo;
 
-    const query = ultimoCorte
-        ? `SELECT metodo_pago, SUM(total) as total FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE AND fecha_creacion > $1 GROUP BY metodo_pago`
-        : `SELECT metodo_pago, SUM(total) as total FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE GROUP BY metodo_pago`;
+    const filtroFecha = ultimoCorte ? 'AND fecha_creacion > $1' : '';
     const params = ultimoCorte ? [ultimoCorte] : [];
 
+    // Un pedido 'Mixto' aporta a DOS bolsillos: su parte en efectivo, y su parte en el método
+    // secundario. Lo "des-pivoteamos" en dos filas (UNION ALL) para que cada bolsillo sume
+    // exactamente lo que físicamente debe haber de ese método, no el total completo del pedido.
+    const query = `
+        SELECT bucket, SUM(monto) as total FROM (
+            SELECT CASE WHEN metodo_pago = 'Mixto' THEN 'Efectivo' ELSE metodo_pago END AS bucket,
+                   CASE WHEN metodo_pago = 'Mixto' THEN monto_efectivo ELSE total END AS monto
+            FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE ${filtroFecha}
+            UNION ALL
+            SELECT metodo_pago_secundario AS bucket, monto_no_efectivo AS monto
+            FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE AND metodo_pago = 'Mixto' ${filtroFecha}
+        ) x GROUP BY bucket
+    `;
     const result = await client.query(query, params);
 
     const resumen = { Efectivo: 0, Tarjeta: 0, Transferencia: 0, 'Aplicación': 0 };
     result.rows.forEach(row => {
-        const metodo = row.metodo_pago || 'Efectivo';
+        const metodo = row.bucket || 'Efectivo';
         const total = parseFloat(row.total);
         if (metodo.includes('Aplicación')) resumen['Aplicación'] += total;
         else if (metodo.includes('Tarjeta')) resumen['Tarjeta'] += total;
         else if (metodo.includes('Transferencia')) resumen['Transferencia'] += total;
         else resumen['Efectivo'] += total;
     });
+
+    // Propinas del periodo: informativas, no forman parte de la reconciliación de caja.
+    const propinasQuery = await client.query(
+        `SELECT COALESCE(SUM(propina), 0) as total FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE ${filtroFecha}`,
+        params
+    );
+    resumen.propinas = parseFloat(propinasQuery.rows[0].total || 0);
+
     return resumen;
 }
 
@@ -1014,6 +1092,7 @@ app.get('/api/corte/historial', async (req, res) => {
                 CAST(real_efectivo AS TEXT) AS real_efectivo,
                 CAST(real_tarjeta AS TEXT) AS real_tarjeta,
                 CAST(diferencia AS TEXT) AS diferencia,
+                CAST(propinas_periodo AS TEXT) AS propinas_periodo,
                 observaciones
             FROM cortes_caja ORDER BY fecha_corte DESC LIMIT 50
         `);
@@ -1033,7 +1112,7 @@ app.post('/api/corte', async (req, res) => {
         await client.query('BEGIN');
 
         const esperado = await calcularVentasDesdeUltimoCorte(client);
-        const total_ventas = Object.values(esperado).reduce((a, b) => a + b, 0);
+        const total_ventas = esperado.Efectivo + esperado.Tarjeta + esperado.Transferencia + esperado['Aplicación'];
 
         if (total_ventas <= 0) {
             await client.query('ROLLBACK');
@@ -1046,10 +1125,10 @@ app.post('/api/corte', async (req, res) => {
 
         const result = await client.query(
             `INSERT INTO cortes_caja
-             (usuario, total_ventas, esperado_efectivo, esperado_tarjeta, esperado_transferencia, esperado_apps, real_efectivo, real_tarjeta, diferencia, observaciones)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             (usuario, total_ventas, esperado_efectivo, esperado_tarjeta, esperado_transferencia, esperado_apps, real_efectivo, real_tarjeta, diferencia, propinas_periodo, observaciones)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              RETURNING id, fecha_corte`,
-            [req.user.username, total_ventas, esperado.Efectivo, esperado.Tarjeta, esperado.Transferencia, esperado['Aplicación'], real_efectivo, real_tarjeta, diferencia, observaciones || '']
+            [req.user.username, total_ventas, esperado.Efectivo, esperado.Tarjeta, esperado.Transferencia, esperado['Aplicación'], real_efectivo, real_tarjeta, diferencia, esperado.propinas, observaciones || '']
         );
 
         await client.query('COMMIT');
