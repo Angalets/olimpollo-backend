@@ -948,20 +948,32 @@ app.get('/api/reportes/semanal', async (req, res) => {
         const client = await pool.connect();
         
         // 1. ANÁLISIS FINANCIERO (Desglose por Canal y Método de Pago)
-        // Agrupa por canal (Uber/Didi/OyR) y método (Efectivo/Tarjeta)
+        // Agrupa por canal (Uber/Didi/OyR) y método (Efectivo/Tarjeta).
+        // Un pedido 'Mixto' aporta a DOS bolsillos: su parte en efectivo, y su parte en el
+        // método secundario. Se "des-pivotea" en dos filas (UNION ALL) igual que en
+        // calcularVentasDesdeUltimoCorte, para que nunca quede clasificado como 'Mixto'
+        // (que el frontend no reconoce) ni desaparezca del desglose.
         const ventasQuery = `
-            SELECT 
-                canal_venta,
-                metodo_pago,
-                COUNT(id) as pedidos,
-                SUM(total) as venta_bruta,
-                SUM(comision) as comisiones
-            FROM Pedidos
-            WHERE estado = 'Entregado' AND eliminado = FALSE
-            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
-            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
-            GROUP BY canal_venta, metodo_pago
-            ORDER BY canal_venta, metodo_pago
+            SELECT canal_venta, bucket AS metodo_pago, COUNT(DISTINCT id) as pedidos,
+                   SUM(monto) as venta_bruta, SUM(comision) as comisiones
+            FROM (
+                SELECT id, canal_venta,
+                       CASE WHEN metodo_pago = 'Mixto' THEN 'Efectivo' ELSE metodo_pago END AS bucket,
+                       CASE WHEN metodo_pago = 'Mixto' THEN monto_efectivo ELSE total END AS monto,
+                       CASE WHEN metodo_pago = 'Mixto' THEN 0 ELSE comision END AS comision
+                FROM Pedidos
+                WHERE estado = 'Entregado' AND eliminado = FALSE
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+                UNION ALL
+                SELECT id, canal_venta, metodo_pago_secundario AS bucket, monto_no_efectivo AS monto, comision
+                FROM Pedidos
+                WHERE estado = 'Entregado' AND eliminado = FALSE AND metodo_pago = 'Mixto'
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+            ) x
+            GROUP BY canal_venta, bucket
+            ORDER BY canal_venta, bucket
         `;
         const ventasRes = await client.query(ventasQuery, [fechaInicio, fechaFin]);
 
