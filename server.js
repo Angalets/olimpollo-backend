@@ -1210,6 +1210,31 @@ app.get('/api/reportes/platillos', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Horas Pico: pedidos/venta por día de la semana × hora, para decisiones de personal.
+// EXTRACT(DOW) de Postgres da 0=Domingo..6=Sábado; se reordena a Lunes..Domingo en la respuesta.
+app.get('/api/reportes/horas-pico', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    try {
+        const query = `
+            SELECT EXTRACT(DOW FROM (fecha_creacion AT TIME ZONE 'America/Hermosillo'))::int AS dia_semana,
+                   EXTRACT(HOUR FROM (fecha_creacion AT TIME ZONE 'America/Hermosillo'))::int AS hora,
+                   COUNT(id) AS pedidos, SUM(total) AS venta
+            FROM Pedidos
+            WHERE estado = 'Entregado' AND eliminado = FALSE
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+            GROUP BY dia_semana, hora
+            ORDER BY dia_semana, hora
+        `;
+        const result = await pool.query(query, [fechaInicio, fechaFin]);
+        const celdas = result.rows.map(r => ({
+            dia_semana: r.dia_semana, hora: r.hora,
+            pedidos: parseInt(r.pedidos), venta: parseFloat(r.venta || 0)
+        }));
+        res.status(200).json({ fechaInicio, fechaFin, celdas });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Margen por Platillo: cruza ingreso de ventas (igual que /platillos) con el costo de
 // receta + modificadores (misma lógica que /merma y /insumos-teoricos) para calcular
 // margen real por producto, y clasifica en la matriz de ingeniería de menú
