@@ -1267,6 +1267,132 @@ app.get('/api/reportes/insumos-teoricos', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Fechas con conteo físico guardado (para elegir inicio/fin del reporte de merma)
+app.get('/api/reportes/inventario-fechas', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT ((fecha_registro AT TIME ZONE 'America/Hermosillo')::date)::text AS fecha, COUNT(*) AS insumos_contados
+            FROM Registro_Inventario
+            GROUP BY fecha
+            ORDER BY fecha DESC
+        `);
+        res.status(200).json(result.rows.map(r => ({ fecha: r.fecha, insumos_contados: parseInt(r.insumos_contados) })));
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Merma: cruza conteo físico (Registro_Inventario) + compras del periodo contra el
+// consumo teórico (recetas × ventas, misma lógica que insumos-teoricos) para detectar
+// desperdicio/robo/error de medición entre dos conteos guardados.
+// Fórmula: merma = (conteo_inicial + compras_periodo - conteo_final) - consumo_teorico
+app.get('/api/reportes/merma', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'Selecciona fecha de conteo inicial y final.' });
+    const client = await pool.connect();
+    try {
+        // El día pudo guardarse más de una vez; se usa el último conteo de cada fecha
+        // como el timestamp exacto del "corte" para acotar compras y ventas del periodo.
+        const tsQuery = `SELECT MAX(fecha_registro) AS ts FROM Registro_Inventario WHERE (fecha_registro AT TIME ZONE 'America/Hermosillo')::date = $1`;
+        const [tsInicioRes, tsFinRes] = await Promise.all([
+            client.query(tsQuery, [fechaInicio]),
+            client.query(tsQuery, [fechaFin])
+        ]);
+        const tsInicio = tsInicioRes.rows[0].ts;
+        const tsFin = tsFinRes.rows[0].ts;
+        if (!tsInicio) return res.status(400).json({ error: `No hay un conteo de inventario guardado el ${fechaInicio}.` });
+        if (!tsFin) return res.status(400).json({ error: `No hay un conteo de inventario guardado el ${fechaFin}.` });
+        if (tsFin <= tsInicio) return res.status(400).json({ error: 'La fecha final debe ser posterior a la fecha inicial.' });
+
+        const [snapInicioRes, snapFinalRes, comprasRes, ventasRes, recetasRes, opcionesRes, insumosRes] = await Promise.all([
+            client.query(`SELECT insumo_id, nombre_insumo, cantidad_registrada, unidad_medida FROM Registro_Inventario WHERE fecha_registro = $1`, [tsInicio]),
+            client.query(`SELECT insumo_id, cantidad_registrada FROM Registro_Inventario WHERE fecha_registro = $1`, [tsFin]),
+            client.query(`SELECT ci.insumo_id, SUM(ci.cantidad_comprada) AS cantidad
+                FROM compra_items ci JOIN compras c ON ci.compra_id = c.id
+                WHERE c.fecha_compra > $1 AND c.fecha_compra <= $2
+                GROUP BY ci.insumo_id`, [tsInicio, tsFin]),
+            client.query(`SELECT pi.menu_producto_id, pi.nombre_producto, pi.cantidad
+                FROM pedido_items pi JOIN pedidos p ON pi.pedido_id = p.id
+                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+                AND p.fecha_creacion > $1 AND p.fecha_creacion <= $2`, [tsInicio, tsFin]),
+            client.query(`SELECT mp.id AS producto_id, ri.insumo_id, ri.cantidad_necesaria
+                FROM menu_productos mp JOIN recetas r ON mp.receta_id = r.id
+                JOIN receta_insumo ri ON r.id = ri.receta_id`),
+            client.query(`SELECT valor, insumo_id, cantidad_insumo FROM menu_opciones WHERE insumo_id IS NOT NULL`),
+            client.query(`SELECT id, nombre, costo_promedio FROM insumos`)
+        ]);
+
+        const mapRecetas = {};
+        recetasRes.rows.forEach(r => { (mapRecetas[r.producto_id] = mapRecetas[r.producto_id] || []).push(r); });
+        const mapOpciones = {};
+        opcionesRes.rows.forEach(o => { mapOpciones[o.valor.toUpperCase()] = o; });
+
+        // Consumo teórico por insumo_id (misma lógica que /insumos-teoricos, pero keyed por id
+        // en vez de nombre, para poder cruzar con conteo físico/compras sin depender del texto)
+        const consumoTeorico = {};
+        ventasRes.rows.forEach(v => {
+            if (mapRecetas[v.menu_producto_id]) {
+                mapRecetas[v.menu_producto_id].forEach(ing => {
+                    consumoTeorico[ing.insumo_id] = (consumoTeorico[ing.insumo_id] || 0) + (ing.cantidad_necesaria * v.cantidad);
+                });
+            }
+            const match = v.nombre_producto.match(/\((.*)\)/);
+            if (match) {
+                match[1].split(',').map(m => m.trim().toUpperCase()).forEach(m => {
+                    if (mapOpciones[m]) {
+                        const op = mapOpciones[m];
+                        consumoTeorico[op.insumo_id] = (consumoTeorico[op.insumo_id] || 0) + (op.cantidad_insumo * v.cantidad);
+                    }
+                });
+            }
+        });
+
+        const nombrePorInsumo = {};
+        const costoPorInsumo = {};
+        insumosRes.rows.forEach(i => { nombrePorInsumo[i.id] = i.nombre; costoPorInsumo[i.id] = parseFloat(i.costo_promedio || 0); });
+
+        const inicioMap = {}; snapInicioRes.rows.forEach(r => { inicioMap[r.insumo_id] = r; });
+        const finalMap = {}; snapFinalRes.rows.forEach(r => { finalMap[r.insumo_id] = parseFloat(r.cantidad_registrada); });
+        const comprasMap = {}; comprasRes.rows.forEach(r => { comprasMap[r.insumo_id] = parseFloat(r.cantidad); });
+
+        // Solo se puede calcular merma de un insumo si tiene conteo FINAL guardado (el inicial
+        // se asume 0 si no existía todavía en el conteo inicial, p.ej. un insumo nuevo).
+        const idsConFinal = Object.keys(finalMap).map(Number);
+        const reporte = idsConFinal.map(id => {
+            const info = inicioMap[id];
+            const inicial = info ? parseFloat(info.cantidad_registrada) : 0;
+            const final = finalMap[id];
+            const compras = comprasMap[id] || 0;
+            const teorico = consumoTeorico[id] || 0;
+            const consumoFisico = inicial + compras - final;
+            const merma = consumoFisico - teorico;
+            const costo = costoPorInsumo[id] || 0;
+            return {
+                insumo_id: id,
+                nombre_insumo: (info && info.nombre_insumo) || nombrePorInsumo[id] || `Insumo #${id}`,
+                unidad: info ? info.unidad_medida : '',
+                conteo_inicial: inicial,
+                compras,
+                conteo_final: final,
+                consumo_fisico: consumoFisico,
+                consumo_teorico: teorico,
+                merma,
+                merma_valor: merma * costo,
+                merma_pct: teorico > 0 ? (merma / teorico) * 100 : null
+            };
+        }).sort((a, b) => b.merma_valor - a.merma_valor);
+
+        // Insumos con compras o consumo teórico en el periodo pero SIN conteo final guardado:
+        // no se pueden incluir en el cálculo, pero se avisa para que no se pierdan en silencio.
+        const idsConSenal = new Set([...Object.keys(comprasMap), ...Object.keys(consumoTeorico)].map(Number));
+        const idsReportados = new Set(idsConFinal);
+        const omitidos = [...idsConSenal].filter(id => !idsReportados.has(id)).map(id => nombrePorInsumo[id] || `Insumo #${id}`);
+
+        res.status(200).json({ fecha_inicio: fechaInicio, fecha_fin: fechaFin, reporte, omitidos });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+});
 
 // ======================================================================
 // 10. DEBUGGING
