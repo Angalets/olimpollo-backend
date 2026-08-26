@@ -1235,6 +1235,31 @@ app.get('/api/reportes/horas-pico', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Top Clientes: histórico de siempre (no por rango de fechas). Los pedidos no guardan el
+// teléfono del cliente (solo el nombre), así que agrupar pedidos por nombre arriesgaría
+// mezclar a dos personas distintas con el mismo nombre — el mismo problema que ya se
+// descartó para el CRM (el teléfono es la llave única real). En cambio clientes.total_gastado
+// y .visitas ya están correctamente acumulados por teléfono en cada pedido, así que se leen
+// directo de ahí.
+app.get('/api/reportes/top-clientes', async (req, res) => {
+    try {
+        const result = await pool.query(`SELECT id, nombre, telefono, visitas, total_gastado, puntos, ultima_visita FROM clientes ORDER BY total_gastado DESC`);
+        const ahora = Date.now();
+        const clientes = result.rows.map(c => {
+            const visitas = parseInt(c.visitas || 0);
+            const totalGastado = parseFloat(c.total_gastado || 0);
+            const diasDesdeUltimaVisita = c.ultima_visita ? Math.floor((ahora - new Date(c.ultima_visita).getTime()) / 86400000) : null;
+            return {
+                id: c.id, nombre: c.nombre, telefono: c.telefono, visitas,
+                total_gastado: totalGastado, puntos: parseInt(c.puntos || 0),
+                ticket_promedio: visitas > 0 ? totalGastado / visitas : 0,
+                ultima_visita: c.ultima_visita, dias_desde_ultima_visita: diasDesdeUltimaVisita
+            };
+        });
+        res.status(200).json({ clientes });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Margen por Platillo: cruza ingreso de ventas (igual que /platillos) con el costo de
 // receta + modificadores (misma lógica que /merma y /insumos-teoricos) para calcular
 // margen real por producto, y clasifica en la matriz de ingeniería de menú
