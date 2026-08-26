@@ -342,7 +342,7 @@ app.get('/api/inventario', async (req, res) => {
     
     // CORRECCIÓN: Agregamos 'proveedor_preferido' a la selección
     const query = `
-        SELECT id, nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido,
+        SELECT id, nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido, costo_promedio,
         CASE WHEN cantidad <= 0 THEN 'Agotado' WHEN cantidad <= stock_minimo THEN 'Requiere re-stock' ELSE 'En stock' END AS estado
         FROM Insumos ${where} ORDER BY id;`;
 
@@ -355,12 +355,12 @@ app.get('/api/inventario', async (req, res) => {
 // Crear Insumo
 app.post('/api/inventario', async (req, res) => {
     // CORRECCIÓN: Recibimos proveedor_preferido
-    const { nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido } = req.body;
+    const { nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido, costo_promedio } = req.body;
     try {
         // CORRECCIÓN: Agregamos el campo al INSERT
         const result = await pool.query(
-            'INSERT INTO Insumos (nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *', 
-            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, proveedor_preferido || 'General']
+            'INSERT INTO Insumos (nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido, costo_promedio) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, proveedor_preferido || 'General', parseFloat(costo_promedio) || 0]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -369,12 +369,12 @@ app.post('/api/inventario', async (req, res) => {
 // Editar Insumo
 app.put('/api/inventario/:id', async (req, res) => {
     // CORRECCIÓN: Recibimos proveedor_preferido
-    const { nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido } = req.body;
+    const { nombre, cantidad, unidad, stock_minimo, categoria, proveedor_preferido, costo_promedio } = req.body;
     try {
         // CORRECCIÓN: Agregamos el campo al UPDATE ($6)
         const result = await pool.query(
-            'UPDATE Insumos SET nombre=$1, cantidad=$2, unidad=$3, stock_minimo=$4, categoria=$5, proveedor_preferido=$6 WHERE id=$7 RETURNING *',
-            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, proveedor_preferido || 'General', req.params.id]
+            'UPDATE Insumos SET nombre=$1, cantidad=$2, unidad=$3, stock_minimo=$4, categoria=$5, proveedor_preferido=$6, costo_promedio=$7 WHERE id=$8 RETURNING *',
+            [nombre, parseInt(cantidad), unidad, parseInt(stock_minimo), categoria, proveedor_preferido || 'General', parseFloat(costo_promedio) || 0, req.params.id]
         );
         res.status(200).json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -925,21 +925,27 @@ app.get('/api/reportes/cogs', async (req, res) => {
         // cantidad_necesaria se multiplica por pi.cantidad: la receta indica el insumo
         // por UNA unidad del platillo, y pi.cantidad es cuántas unidades se vendieron
         // en esa línea (igual que ya hace /api/reportes/insumos-teoricos).
-        const query = `
-            SELECT SUM(usage.cantidad_total * i.costo_promedio) as costo_total_insumos
-            FROM (
-                SELECT insumo_id, SUM(cantidad_necesaria * pi.cantidad) as cantidad_total
-                FROM receta_insumo ri
-                JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
-                JOIN pedidos p ON pi.pedido_id = p.id
-                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
-                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
-                GROUP BY insumo_id
-            ) usage
-            JOIN insumos i ON usage.insumo_id = i.id
+        const usageSubquery = `
+            SELECT insumo_id, SUM(cantidad_necesaria * pi.cantidad) as cantidad_total
+            FROM receta_insumo ri
+            JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+            JOIN pedidos p ON pi.pedido_id = p.id
+            WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+            AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+            GROUP BY insumo_id
         `;
-        const result = await pool.query(query, [fechaInicio, fechaFin]);
-        res.json({ costo_total: parseFloat(result.rows[0].costo_total_insumos || 0) });
+        const [costoRes, sinCostoRes] = await Promise.all([
+            pool.query(`SELECT SUM(usage.cantidad_total * i.costo_promedio) as costo_total_insumos
+                FROM (${usageSubquery}) usage JOIN insumos i ON usage.insumo_id = i.id`, [fechaInicio, fechaFin]),
+            // Insumos usados en el periodo pero con costo_promedio en $0 (nunca restockeados en
+            // la app): su costo real cuenta como $0 aquí, así que el total está subestimado.
+            pool.query(`SELECT DISTINCT i.nombre FROM (${usageSubquery}) usage
+                JOIN insumos i ON usage.insumo_id = i.id WHERE COALESCE(i.costo_promedio, 0) <= 0`, [fechaInicio, fechaFin])
+        ]);
+        res.json({
+            costo_total: parseFloat(costoRes.rows[0].costo_total_insumos || 0),
+            insumos_sin_costo: sinCostoRes.rows.map(r => r.nombre)
+        });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -978,12 +984,29 @@ app.get('/api/reportes/cogs-historico', async (req, res) => {
             FULL OUTER JOIN venta_semanal vs ON cs.semana = vs.semana
             ORDER BY semana
         `;
-        const result = await pool.query(query, [fechaInicio, fechaFin]);
-        res.status(200).json(result.rows.map(r => {
-            const costo = parseFloat(r.costo_total || 0);
-            const venta = parseFloat(r.venta_bruta || 0);
-            return { semana: r.semana, costo_total: costo, venta_bruta: venta, porcentaje: venta > 0 ? (costo / venta) * 100 : 0 };
-        }));
+        const sinCostoQuery = `
+            SELECT DISTINCT i.nombre FROM (
+                SELECT ri.insumo_id
+                FROM pedido_items pi
+                JOIN pedidos p ON pi.pedido_id = p.id
+                JOIN receta_insumo ri ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+            ) usage
+            JOIN insumos i ON usage.insumo_id = i.id WHERE COALESCE(i.costo_promedio, 0) <= 0
+        `;
+        const [result, sinCostoRes] = await Promise.all([
+            pool.query(query, [fechaInicio, fechaFin]),
+            pool.query(sinCostoQuery, [fechaInicio, fechaFin])
+        ]);
+        res.status(200).json({
+            semanas: result.rows.map(r => {
+                const costo = parseFloat(r.costo_total || 0);
+                const venta = parseFloat(r.venta_bruta || 0);
+                return { semana: r.semana, costo_total: costo, venta_bruta: venta, porcentaje: venta > 0 ? (costo / venta) * 100 : 0 };
+            }),
+            insumos_sin_costo: sinCostoRes.rows.map(r => r.nombre)
+        });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1204,11 +1227,12 @@ app.get('/api/reportes/margen-platillos', async (req, res) => {
                 FROM menu_productos mp JOIN recetas r ON mp.receta_id = r.id
                 JOIN receta_insumo ri ON r.id = ri.receta_id`),
             pool.query(`SELECT valor, insumo_id, cantidad_insumo FROM menu_opciones WHERE insumo_id IS NOT NULL`),
-            pool.query(`SELECT id, costo_promedio FROM insumos`)
+            pool.query(`SELECT id, nombre, costo_promedio FROM insumos`)
         ]);
 
         const costoPorInsumo = {};
-        insumosRes.rows.forEach(i => { costoPorInsumo[i.id] = parseFloat(i.costo_promedio || 0); });
+        const nombrePorInsumo = {};
+        insumosRes.rows.forEach(i => { costoPorInsumo[i.id] = parseFloat(i.costo_promedio || 0); nombrePorInsumo[i.id] = i.nombre; });
 
         const mapRecetas = {};
         recetasRes.rows.forEach(r => { (mapRecetas[r.producto_id] = mapRecetas[r.producto_id] || []).push(r); });
@@ -1218,24 +1242,42 @@ app.get('/api/reportes/margen-platillos', async (req, res) => {
 
         // Acumular por nombre_venta (mismo agrupador que /platillos, ignora variantes de modificador)
         const acc = {};
+        const insumosSinCostoGlobal = new Set();
         ventasRes.rows.forEach(v => {
             const key = v.nombre_venta;
-            if (!acc[key]) acc[key] = { producto: key, cantidad_vendida: 0, ingreso_generado: 0, costo_total: 0, sin_receta: false };
+            if (!acc[key]) acc[key] = { producto: key, cantidad_vendida: 0, ingreso_generado: 0, costo_total: 0, sin_receta: false, insumos_sin_costo: new Set() };
             const row = acc[key];
             row.cantidad_vendida += v.cantidad;
             row.ingreso_generado += v.cantidad * parseFloat(v.precio_unitario);
 
+            // Registra un insumo usado en costo $0 como "sin costo" en vez de dejarlo entrar
+            // silenciosamente como $0 al total — un insumo nunca restockeado en la app queda así
+            // aunque su receta esté completa, y eso vuelve el margen calculado no confiable.
+            const marcarSinCosto = (insumoId) => {
+                row.insumos_sin_costo.add(nombrePorInsumo[insumoId] || `Insumo #${insumoId}`);
+                insumosSinCostoGlobal.add(nombrePorInsumo[insumoId] || `Insumo #${insumoId}`);
+            };
+
             const receta = mapRecetas[v.menu_producto_id];
             let costoUnitario = 0;
             if (receta && receta.length > 0) {
-                costoUnitario += receta.reduce((s, ing) => s + (ing.cantidad_necesaria * (costoPorInsumo[ing.insumo_id] || 0)), 0);
+                receta.forEach(ing => {
+                    const costo = costoPorInsumo[ing.insumo_id] || 0;
+                    if (costo <= 0) marcarSinCosto(ing.insumo_id);
+                    costoUnitario += ing.cantidad_necesaria * costo;
+                });
             } else {
                 row.sin_receta = true; // costo real desconocido: no se debe leer su margen como confiable
             }
             const match = v.nombre_producto.match(/\((.*)\)/);
             if (match) {
                 match[1].split(',').map(m => m.trim().toUpperCase()).forEach(m => {
-                    if (mapOpciones[m]) costoUnitario += mapOpciones[m].cantidad_insumo * (costoPorInsumo[mapOpciones[m].insumo_id] || 0);
+                    if (mapOpciones[m]) {
+                        const op = mapOpciones[m];
+                        const costo = costoPorInsumo[op.insumo_id] || 0;
+                        if (costo <= 0) marcarSinCosto(op.insumo_id);
+                        costoUnitario += op.cantidad_insumo * costo;
+                    }
                 });
             }
             row.costo_total += costoUnitario * v.cantidad;
@@ -1245,12 +1287,15 @@ app.get('/api/reportes/margen-platillos', async (req, res) => {
             r.margen_total = r.ingreso_generado - r.costo_total;
             r.margen_unitario = r.cantidad_vendida > 0 ? r.margen_total / r.cantidad_vendida : 0;
             r.margen_pct = r.ingreso_generado > 0 ? (r.margen_total / r.ingreso_generado) * 100 : null;
+            r.costo_incompleto = r.insumos_sin_costo.size > 0;
+            r.insumos_sin_costo = [...r.insumos_sin_costo];
             return r;
         });
 
         // Matriz de ingeniería de menú (Kasavana & Smith): solo sobre productos con receta
-        // configurada — sin eso el "margen" no es un dato real, es un cero por omisión.
-        const evaluables = productos.filter(p => !p.sin_receta);
+        // Y costo completo — un insumo nunca restockeado (costo $0) vuelve el margen tan poco
+        // confiable como no tener receta, así que ambos casos quedan fuera de la clasificación.
+        const evaluables = productos.filter(p => !p.sin_receta && !p.costo_incompleto);
         const totalUnidades = evaluables.reduce((s, p) => s + p.cantidad_vendida, 0);
         const totalMargen = evaluables.reduce((s, p) => s + p.margen_total, 0);
         const umbralPopularidadPct = evaluables.length > 0 ? (0.7 * (1 / evaluables.length)) * 100 : 0;
@@ -1258,6 +1303,7 @@ app.get('/api/reportes/margen-platillos', async (req, res) => {
 
         productos.forEach(p => {
             if (p.sin_receta) { p.clasificacion = 'Sin receta'; return; }
+            if (p.costo_incompleto) { p.clasificacion = 'Costo Incompleto'; return; }
             const mixPct = totalUnidades > 0 ? (p.cantidad_vendida / totalUnidades) * 100 : 0;
             const esPopular = mixPct >= umbralPopularidadPct;
             const esRentable = p.margen_unitario >= margenPromedioUnitario;
@@ -1275,6 +1321,8 @@ app.get('/api/reportes/margen-platillos', async (req, res) => {
             margen_promedio_unitario: margenPromedioUnitario,
             umbral_popularidad_pct: umbralPopularidadPct,
             productos_sin_receta: productos.filter(p => p.sin_receta).map(p => p.producto),
+            productos_costo_incompleto: productos.filter(p => p.costo_incompleto).map(p => p.producto),
+            insumos_sin_costo: [...insumosSinCostoGlobal],
             reporte: productos
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
