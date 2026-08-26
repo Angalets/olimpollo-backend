@@ -1187,6 +1187,99 @@ app.get('/api/reportes/platillos', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Margen por Platillo: cruza ingreso de ventas (igual que /platillos) con el costo de
+// receta + modificadores (misma lógica que /merma y /insumos-teoricos) para calcular
+// margen real por producto, y clasifica en la matriz de ingeniería de menú
+// (Estrella/Caballo de Batalla/Enigma/Perro) según popularidad × rentabilidad.
+app.get('/api/reportes/margen-platillos', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    try {
+        const [ventasRes, recetasRes, opcionesRes, insumosRes] = await Promise.all([
+            pool.query(`SELECT pi.menu_producto_id, mp.nombre_venta, pi.nombre_producto, pi.cantidad, pi.precio_unitario
+                FROM pedido_items pi JOIN pedidos p ON pi.pedido_id = p.id JOIN menu_productos mp ON pi.menu_producto_id = mp.id
+                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2`, [fechaInicio, fechaFin]),
+            pool.query(`SELECT mp.id AS producto_id, ri.insumo_id, ri.cantidad_necesaria
+                FROM menu_productos mp JOIN recetas r ON mp.receta_id = r.id
+                JOIN receta_insumo ri ON r.id = ri.receta_id`),
+            pool.query(`SELECT valor, insumo_id, cantidad_insumo FROM menu_opciones WHERE insumo_id IS NOT NULL`),
+            pool.query(`SELECT id, costo_promedio FROM insumos`)
+        ]);
+
+        const costoPorInsumo = {};
+        insumosRes.rows.forEach(i => { costoPorInsumo[i.id] = parseFloat(i.costo_promedio || 0); });
+
+        const mapRecetas = {};
+        recetasRes.rows.forEach(r => { (mapRecetas[r.producto_id] = mapRecetas[r.producto_id] || []).push(r); });
+
+        const mapOpciones = {};
+        opcionesRes.rows.forEach(o => { mapOpciones[o.valor.toUpperCase()] = o; });
+
+        // Acumular por nombre_venta (mismo agrupador que /platillos, ignora variantes de modificador)
+        const acc = {};
+        ventasRes.rows.forEach(v => {
+            const key = v.nombre_venta;
+            if (!acc[key]) acc[key] = { producto: key, cantidad_vendida: 0, ingreso_generado: 0, costo_total: 0, sin_receta: false };
+            const row = acc[key];
+            row.cantidad_vendida += v.cantidad;
+            row.ingreso_generado += v.cantidad * parseFloat(v.precio_unitario);
+
+            const receta = mapRecetas[v.menu_producto_id];
+            let costoUnitario = 0;
+            if (receta && receta.length > 0) {
+                costoUnitario += receta.reduce((s, ing) => s + (ing.cantidad_necesaria * (costoPorInsumo[ing.insumo_id] || 0)), 0);
+            } else {
+                row.sin_receta = true; // costo real desconocido: no se debe leer su margen como confiable
+            }
+            const match = v.nombre_producto.match(/\((.*)\)/);
+            if (match) {
+                match[1].split(',').map(m => m.trim().toUpperCase()).forEach(m => {
+                    if (mapOpciones[m]) costoUnitario += mapOpciones[m].cantidad_insumo * (costoPorInsumo[mapOpciones[m].insumo_id] || 0);
+                });
+            }
+            row.costo_total += costoUnitario * v.cantidad;
+        });
+
+        const productos = Object.values(acc).map(r => {
+            r.margen_total = r.ingreso_generado - r.costo_total;
+            r.margen_unitario = r.cantidad_vendida > 0 ? r.margen_total / r.cantidad_vendida : 0;
+            r.margen_pct = r.ingreso_generado > 0 ? (r.margen_total / r.ingreso_generado) * 100 : null;
+            return r;
+        });
+
+        // Matriz de ingeniería de menú (Kasavana & Smith): solo sobre productos con receta
+        // configurada — sin eso el "margen" no es un dato real, es un cero por omisión.
+        const evaluables = productos.filter(p => !p.sin_receta);
+        const totalUnidades = evaluables.reduce((s, p) => s + p.cantidad_vendida, 0);
+        const totalMargen = evaluables.reduce((s, p) => s + p.margen_total, 0);
+        const umbralPopularidadPct = evaluables.length > 0 ? (0.7 * (1 / evaluables.length)) * 100 : 0;
+        const margenPromedioUnitario = totalUnidades > 0 ? totalMargen / totalUnidades : 0;
+
+        productos.forEach(p => {
+            if (p.sin_receta) { p.clasificacion = 'Sin receta'; return; }
+            const mixPct = totalUnidades > 0 ? (p.cantidad_vendida / totalUnidades) * 100 : 0;
+            const esPopular = mixPct >= umbralPopularidadPct;
+            const esRentable = p.margen_unitario >= margenPromedioUnitario;
+            p.mix_pct = mixPct;
+            p.clasificacion = esPopular && esRentable ? 'Estrella'
+                : esPopular && !esRentable ? 'Caballo de Batalla'
+                : !esPopular && esRentable ? 'Enigma'
+                : 'Perro';
+        });
+
+        productos.sort((a, b) => b.margen_total - a.margen_total);
+
+        res.status(200).json({
+            fechaInicio, fechaFin,
+            margen_promedio_unitario: margenPromedioUnitario,
+            umbral_popularidad_pct: umbralPopularidadPct,
+            productos_sin_receta: productos.filter(p => p.sin_receta).map(p => p.producto),
+            reporte: productos
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Reporte Histórico de Inventario (Recuperado)
 app.get('/api/reportes/inventario', async (req, res) => {
     const { fecha } = req.query;
