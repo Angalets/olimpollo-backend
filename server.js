@@ -922,10 +922,13 @@ app.delete('/api/recetas/:id', async (req, res) => {
 app.get('/api/reportes/cogs', async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
     try {
+        // cantidad_necesaria se multiplica por pi.cantidad: la receta indica el insumo
+        // por UNA unidad del platillo, y pi.cantidad es cuántas unidades se vendieron
+        // en esa línea (igual que ya hace /api/reportes/insumos-teoricos).
         const query = `
             SELECT SUM(usage.cantidad_total * i.costo_promedio) as costo_total_insumos
             FROM (
-                SELECT insumo_id, SUM(cantidad_necesaria) as cantidad_total
+                SELECT insumo_id, SUM(cantidad_necesaria * pi.cantidad) as cantidad_total
                 FROM receta_insumo ri
                 JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
                 JOIN pedidos p ON pi.pedido_id = p.id
@@ -937,6 +940,50 @@ app.get('/api/reportes/cogs', async (req, res) => {
         `;
         const result = await pool.query(query, [fechaInicio, fechaFin]);
         res.json({ costo_total: parseFloat(result.rows[0].costo_total_insumos || 0) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Tendencia histórica de % COGS, agrupado por semana (para gráfica de línea)
+app.get('/api/reportes/cogs-historico', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    try {
+        const query = `
+            WITH costo_semanal AS (
+                SELECT c.semana, SUM(c.cantidad_total * i.costo_promedio) AS costo_total
+                FROM (
+                    SELECT date_trunc('week', (p.fecha_creacion AT TIME ZONE 'America/Hermosillo'))::date AS semana,
+                           ri.insumo_id, SUM(ri.cantidad_necesaria * pi.cantidad) AS cantidad_total
+                    FROM pedido_items pi
+                    JOIN pedidos p ON pi.pedido_id = p.id
+                    JOIN receta_insumo ri ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+                    WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+                    AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+                    GROUP BY semana, ri.insumo_id
+                ) c
+                JOIN insumos i ON c.insumo_id = i.id
+                GROUP BY c.semana
+            ),
+            venta_semanal AS (
+                SELECT date_trunc('week', (fecha_creacion AT TIME ZONE 'America/Hermosillo'))::date AS semana,
+                       SUM(total) AS venta_bruta
+                FROM pedidos
+                WHERE estado = 'Entregado' AND eliminado = FALSE
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+                GROUP BY semana
+            )
+            SELECT COALESCE(cs.semana, vs.semana)::text AS semana,
+                   COALESCE(cs.costo_total, 0) AS costo_total,
+                   COALESCE(vs.venta_bruta, 0) AS venta_bruta
+            FROM costo_semanal cs
+            FULL OUTER JOIN venta_semanal vs ON cs.semana = vs.semana
+            ORDER BY semana
+        `;
+        const result = await pool.query(query, [fechaInicio, fechaFin]);
+        res.status(200).json(result.rows.map(r => {
+            const costo = parseFloat(r.costo_total || 0);
+            const venta = parseFloat(r.venta_bruta || 0);
+            return { semana: r.semana, costo_total: costo, venta_bruta: venta, porcentaje: venta > 0 ? (costo / venta) * 100 : 0 };
+        }));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1070,6 +1117,27 @@ app.get('/api/reportes/ventas', async (req, res) => {
             ventas_totales: parseFloat(result.rows[0].ventas_totales || 0).toFixed(2),
             comisiones: parseFloat(result.rows[0].comisiones_totales || 0).toFixed(2)
         });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Ventas agrupadas por día (para gráfica de tendencia)
+app.get('/api/reportes/ventas-diario', async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    try {
+        const query = `SELECT (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date::text AS fecha,
+                COUNT(id) AS total_pedidos, SUM(total) AS ventas_totales, SUM(comision) AS comisiones_totales
+            FROM Pedidos
+            WHERE (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date >= $1
+            AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date <= $2
+            AND estado = 'Entregado' AND eliminado = FALSE
+            GROUP BY fecha ORDER BY fecha`;
+        const result = await pool.query(query, [fechaInicio, fechaFin]);
+        res.status(200).json(result.rows.map(r => ({
+            fecha: r.fecha,
+            total_pedidos: parseInt(r.total_pedidos || 0),
+            ventas_totales: parseFloat(r.ventas_totales || 0),
+            comisiones: parseFloat(r.comisiones_totales || 0)
+        })));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
