@@ -227,10 +227,13 @@ app.get('/api/menu/digital', async (req, res) => {
 // CRUD Productos
 app.get('/api/menu/productos', async (req, res) => {
     try {
-        // Agregamos imagen_url a la consulta
-        const result = await pool.query('SELECT id, nombre_venta, categoria, receta_id, imagen_url, grupos_modificadores, visible_menu FROM menu_productos ORDER BY nombre_venta');
+        // precio_base faltaba en este SELECT (a diferencia de /api/menu/pos y /api/menu/digital,
+        // que sí lo traen) — el formulario de editar producto y el costeo de recetas.html
+        // dependen de este endpoint, así que sin esto el precio siempre llegaba undefined,
+        // aunque el valor real en la BD estuviera correcto.
+        const result = await pool.query('SELECT id, nombre_venta, categoria, CAST(precio_base AS TEXT) AS precio_base, receta_id, imagen_url, grupos_modificadores, visible_menu FROM menu_productos ORDER BY nombre_venta');
         const componentesPorProducto = await obtenerComponentesPorProducto();
-        const productos = result.rows.map(p => ({ ...p, componentes: componentesPorProducto[p.id] || [] }));
+        const productos = result.rows.map(p => ({ ...p, precio_base: parseFloat(p.precio_base), componentes: componentesPorProducto[p.id] || [] }));
         res.status(200).json(productos);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -852,9 +855,11 @@ app.put('/api/clientes/:id', async (req, res) => {
 // 8. RECETAS (Endpoint Corregido)
 // ======================================================================
 app.get('/api/recetas', async (req, res) => {
-    const query = `SELECT r.id, r.nombre, r.descripcion, r.pasos, 
-        (SELECT json_agg(json_build_object('insumo_id', ri.insumo_id, 'cantidad_necesaria', CAST(ri.cantidad_necesaria AS TEXT), 'unidad_medida', ri.unidad_medida)) 
-        FROM receta_insumo ri WHERE ri.receta_id = r.id) as ingredientes FROM Recetas r ORDER BY r.nombre`;
+    // 'nombre' del insumo faltaba en el json_build_object — el desglose de ingredientes
+    // en recetas.html siempre mostraba "undefined" en vez del nombre real.
+    const query = `SELECT r.id, r.nombre, r.descripcion, r.pasos,
+        (SELECT json_agg(json_build_object('insumo_id', ri.insumo_id, 'nombre', i.nombre, 'cantidad_necesaria', CAST(ri.cantidad_necesaria AS TEXT), 'unidad_medida', ri.unidad_medida))
+        FROM receta_insumo ri JOIN insumos i ON ri.insumo_id = i.id WHERE ri.receta_id = r.id) as ingredientes FROM Recetas r ORDER BY r.nombre`;
     try {
         const result = await pool.query(query);
         res.status(200).json(result.rows);
