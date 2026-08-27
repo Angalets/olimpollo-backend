@@ -1282,7 +1282,7 @@ app.get('/api/reportes/costeo-menu', async (req, res) => {
         const productos = prodRes.rows.map(p => {
             const precio = parseFloat(p.precio_base || 0);
             if (!p.receta_id) {
-                return { id: p.id, producto: p.nombre_venta, precio_venta: precio, sin_receta: true, costo_incompleto: false };
+                return { id: p.id, producto: p.nombre_venta, precio_venta: precio, sin_receta: true, costo_incompleto: false, sin_precio: false };
             }
             const ingredientes = ingredientesPorReceta[p.receta_id] || [];
             let costo = 0; const insumosSinCosto = [];
@@ -1292,18 +1292,22 @@ app.get('/api/reportes/costeo-menu', async (req, res) => {
                 costo += ing.cantidad_necesaria * c;
             });
             const costoIncompleto = insumosSinCosto.length > 0;
+            // precio_base puede ser 0 en productos legacy/sin precio asignado — no es lo
+            // mismo que "sin receta", pero igual vuelve el margen % indefinido (no confiable).
+            const sinPrecio = precio <= 0;
             const margen = precio - costo;
             return {
                 id: p.id, producto: p.nombre_venta, precio_venta: precio,
-                costo_receta: costo, margen, margen_pct: precio > 0 ? (margen / precio) * 100 : null,
-                sin_receta: false, costo_incompleto: costoIncompleto, insumos_sin_costo: insumosSinCosto
+                costo_receta: costo, margen, margen_pct: !sinPrecio ? (margen / precio) * 100 : null,
+                sin_receta: false, costo_incompleto: costoIncompleto, sin_precio: sinPrecio, insumos_sin_costo: insumosSinCosto
             };
         });
 
-        // Peor margen primero (más accionable); sin receta / costo incompleto al final,
-        // ya que su margen no es un dato confiable.
+        // Peor margen primero (más accionable); sin receta / costo incompleto / sin precio al
+        // final, ya que su margen no es un dato confiable.
         productos.sort((a, b) => {
-            const aValido = !a.sin_receta && !a.costo_incompleto, bValido = !b.sin_receta && !b.costo_incompleto;
+            const aValido = !a.sin_receta && !a.costo_incompleto && !a.sin_precio;
+            const bValido = !b.sin_receta && !b.costo_incompleto && !b.sin_precio;
             if (aValido && !bValido) return -1;
             if (!aValido && bValido) return 1;
             if (!aValido && !bValido) return 0;
@@ -1313,7 +1317,8 @@ app.get('/api/reportes/costeo-menu', async (req, res) => {
         res.status(200).json({
             productos,
             productos_sin_receta: productos.filter(p => p.sin_receta).map(p => p.producto),
-            productos_costo_incompleto: productos.filter(p => p.costo_incompleto).map(p => p.producto)
+            productos_costo_incompleto: productos.filter(p => p.costo_incompleto).map(p => p.producto),
+            productos_sin_precio: productos.filter(p => p.sin_precio).map(p => p.producto)
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
