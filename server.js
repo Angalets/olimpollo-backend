@@ -1260,6 +1260,64 @@ app.get('/api/reportes/top-clientes', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Costeo de Menú: ficha de costeo por producto (costo de receta vs. precio de venta
+// ACTUAL del menú), sin depender de ventas ni de un rango de fechas — a diferencia de
+// /margen-platillos (que promedia lo REALMENTE vendido en un periodo), esto muestra el
+// margen teórico de TODOS los productos con receta configurada, se hayan vendido o no.
+// No incluye el costo de modificadores (son variables por pedido, no parte de la receta base).
+app.get('/api/reportes/costeo-menu', async (req, res) => {
+    try {
+        const [prodRes, recetasRes, insumosRes] = await Promise.all([
+            pool.query(`SELECT id, nombre_venta, precio_base, receta_id FROM menu_productos ORDER BY nombre_venta`),
+            pool.query(`SELECT receta_id, insumo_id, cantidad_necesaria FROM receta_insumo`),
+            pool.query(`SELECT id, nombre, costo_promedio FROM insumos`)
+        ]);
+
+        const costoPorInsumo = {}; const nombrePorInsumo = {};
+        insumosRes.rows.forEach(i => { costoPorInsumo[i.id] = parseFloat(i.costo_promedio || 0); nombrePorInsumo[i.id] = i.nombre; });
+
+        const ingredientesPorReceta = {};
+        recetasRes.rows.forEach(r => { (ingredientesPorReceta[r.receta_id] = ingredientesPorReceta[r.receta_id] || []).push(r); });
+
+        const productos = prodRes.rows.map(p => {
+            const precio = parseFloat(p.precio_base || 0);
+            if (!p.receta_id) {
+                return { id: p.id, producto: p.nombre_venta, precio_venta: precio, sin_receta: true, costo_incompleto: false };
+            }
+            const ingredientes = ingredientesPorReceta[p.receta_id] || [];
+            let costo = 0; const insumosSinCosto = [];
+            ingredientes.forEach(ing => {
+                const c = costoPorInsumo[ing.insumo_id] || 0;
+                if (c <= 0) insumosSinCosto.push(nombrePorInsumo[ing.insumo_id] || `Insumo #${ing.insumo_id}`);
+                costo += ing.cantidad_necesaria * c;
+            });
+            const costoIncompleto = insumosSinCosto.length > 0;
+            const margen = precio - costo;
+            return {
+                id: p.id, producto: p.nombre_venta, precio_venta: precio,
+                costo_receta: costo, margen, margen_pct: precio > 0 ? (margen / precio) * 100 : null,
+                sin_receta: false, costo_incompleto: costoIncompleto, insumos_sin_costo: insumosSinCosto
+            };
+        });
+
+        // Peor margen primero (más accionable); sin receta / costo incompleto al final,
+        // ya que su margen no es un dato confiable.
+        productos.sort((a, b) => {
+            const aValido = !a.sin_receta && !a.costo_incompleto, bValido = !b.sin_receta && !b.costo_incompleto;
+            if (aValido && !bValido) return -1;
+            if (!aValido && bValido) return 1;
+            if (!aValido && !bValido) return 0;
+            return a.margen_pct - b.margen_pct;
+        });
+
+        res.status(200).json({
+            productos,
+            productos_sin_receta: productos.filter(p => p.sin_receta).map(p => p.producto),
+            productos_costo_incompleto: productos.filter(p => p.costo_incompleto).map(p => p.producto)
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Margen por Platillo: cruza ingreso de ventas (igual que /platillos) con el costo de
 // receta + modificadores (misma lógica que /merma y /insumos-teoricos) para calcular
 // margen real por producto, y clasifica en la matriz de ingeniería de menú
