@@ -439,6 +439,83 @@ app.post('/api/compras', async (req, res) => {
 
 
 // ======================================================================
+// 5.1 GASTOS OPERATIVOS (GESTIÓN FINANCIERA)
+// ======================================================================
+// Gastos del negocio que NO son compra de insumos de inventario (renta, servicios,
+// nómina, mantenimiento, etc.) — necesarios para calcular la utilidad real del
+// negocio (Estado de Resultados), más allá del solo costo de venta (COGS).
+// Financiero y Admin-only, igual que el resto de datos sensibles de dinero del sistema.
+const CATEGORIAS_GASTO = ['Renta', 'Servicios', 'Nómina', 'Mantenimiento', 'Marketing', 'Empaque y Desechables', 'Transporte', 'Otros'];
+
+app.get('/api/gastos/categorias', requireAdmin, (req, res) => {
+    res.json(CATEGORIAS_GASTO);
+});
+
+// Listar gastos de un periodo (por fecha_gasto), opcionalmente filtrados por categoría
+app.get('/api/gastos', requireAdmin, async (req, res) => {
+    const { fechaInicio, fechaFin, categoria } = req.query;
+    try {
+        const condiciones = [];
+        const params = [];
+        if (fechaInicio) { params.push(fechaInicio); condiciones.push(`fecha_gasto >= $${params.length}`); }
+        if (fechaFin) { params.push(fechaFin); condiciones.push(`fecha_gasto <= $${params.length}`); }
+        if (categoria) { params.push(categoria); condiciones.push(`categoria = $${params.length}`); }
+        const where = condiciones.length ? `WHERE ${condiciones.join(' AND ')}` : '';
+        const result = await pool.query(
+            `SELECT g.id, g.concepto, g.categoria, g.monto, g.fecha_gasto, g.proveedor, g.notas, u.username AS registrado_por
+             FROM gastos g LEFT JOIN Usuarios u ON g.usuario_id = u.id
+             ${where} ORDER BY g.fecha_gasto DESC, g.id DESC`,
+            params
+        );
+        res.status(200).json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Registrar un gasto
+app.post('/api/gastos', requireAdmin, async (req, res) => {
+    const { concepto, categoria, monto, fecha_gasto, proveedor, notas } = req.body;
+    const montoNum = parseFloat(monto);
+    if (!concepto || !concepto.trim()) return res.status(400).json({ error: 'El concepto es requerido.' });
+    if (!CATEGORIAS_GASTO.includes(categoria)) return res.status(400).json({ error: 'Categoría inválida.' });
+    if (isNaN(montoNum) || montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0.' });
+    try {
+        const result = await pool.query(
+            `INSERT INTO gastos (concepto, categoria, monto, fecha_gasto, proveedor, notas, usuario_id)
+             VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE), $5, $6, $7) RETURNING *`,
+            [concepto.trim(), categoria, montoNum, fecha_gasto || null, proveedor || null, notas || null, req.user.userId]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Editar un gasto (corrección de captura)
+app.put('/api/gastos/:id', requireAdmin, async (req, res) => {
+    const { concepto, categoria, monto, fecha_gasto, proveedor, notas } = req.body;
+    const montoNum = parseFloat(monto);
+    if (!concepto || !concepto.trim()) return res.status(400).json({ error: 'El concepto es requerido.' });
+    if (!CATEGORIAS_GASTO.includes(categoria)) return res.status(400).json({ error: 'Categoría inválida.' });
+    if (isNaN(montoNum) || montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0.' });
+    try {
+        const result = await pool.query(
+            `UPDATE gastos SET concepto = $1, categoria = $2, monto = $3, fecha_gasto = $4, proveedor = $5, notas = $6
+             WHERE id = $7 RETURNING *`,
+            [concepto.trim(), categoria, montoNum, fecha_gasto, proveedor || null, notas || null, req.params.id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Gasto no encontrado.' });
+        res.status(200).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Eliminar un gasto (corrección de captura, sin rastro histórico de por medio como sí lo hay en pedidos)
+app.delete('/api/gastos/:id', requireAdmin, async (req, res) => {
+    try {
+        await pool.query('DELETE FROM gastos WHERE id = $1', [req.params.id]);
+        res.status(204).send();
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ======================================================================
 // 6. GESTIÓN DE PEDIDOS (CORE)
 // ======================================================================
 
@@ -1651,6 +1728,133 @@ app.get('/api/reportes/merma', async (req, res) => {
     } finally {
         client.release();
     }
+});
+
+// ======================================================================
+// 9.1 ESTADO DE RESULTADOS (GESTIÓN FINANCIERA)
+// ======================================================================
+// Combina ventas netas (ya restando comisiones, igual que el resto de reportes), costo
+// de venta (COGS, misma lógica que /api/reportes/cogs) y gastos operativos (tabla
+// `gastos`, sección 5.1) para dar una utilidad neta real del periodo, no solo el margen
+// bruto de venta. Admin-only: expone márgenes reales y montos de nómina/renta.
+
+// Costo de venta (COGS) de un rango de fechas — misma lógica ya probada en /api/reportes/cogs,
+// factorizada aquí para reutilizarse en el estado de resultados de un periodo.
+async function calcularCostoVenta(fechaInicio, fechaFin) {
+    const usageSubquery = `
+        SELECT insumo_id, SUM(cantidad_necesaria * pi.cantidad) as cantidad_total
+        FROM receta_insumo ri
+        JOIN pedido_items pi ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+        JOIN pedidos p ON pi.pedido_id = p.id
+        WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+        AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+        GROUP BY insumo_id
+    `;
+    const [costoRes, sinCostoRes] = await Promise.all([
+        pool.query(`SELECT SUM(usage.cantidad_total * i.costo_promedio) as costo_total_insumos
+            FROM (${usageSubquery}) usage JOIN insumos i ON usage.insumo_id = i.id`, [fechaInicio, fechaFin]),
+        pool.query(`SELECT DISTINCT i.nombre FROM (${usageSubquery}) usage
+            JOIN insumos i ON usage.insumo_id = i.id WHERE COALESCE(i.costo_promedio, 0) <= 0`, [fechaInicio, fechaFin])
+    ]);
+    return {
+        costo_total: parseFloat(costoRes.rows[0].costo_total_insumos || 0),
+        insumos_sin_costo: sinCostoRes.rows.map(r => r.nombre)
+    };
+}
+
+// Estado de resultados de un periodo (mes elegido u otro rango de fechas)
+app.get('/api/reportes/estado-resultados', requireAdmin, async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'Selecciona fecha de inicio y fecha fin.' });
+    try {
+        const [ventasRes, costoVenta, gastosRes] = await Promise.all([
+            pool.query(`SELECT COALESCE(SUM(total), 0) AS ventas_brutas, COALESCE(SUM(comision), 0) AS comisiones
+                FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2`, [fechaInicio, fechaFin]),
+            calcularCostoVenta(fechaInicio, fechaFin),
+            pool.query(`SELECT categoria, SUM(monto) AS total FROM gastos
+                WHERE fecha_gasto BETWEEN $1 AND $2 GROUP BY categoria ORDER BY total DESC`, [fechaInicio, fechaFin])
+        ]);
+
+        const ventasBrutas = parseFloat(ventasRes.rows[0].ventas_brutas);
+        const comisiones = parseFloat(ventasRes.rows[0].comisiones);
+        const ingresosNetos = ventasBrutas - comisiones;
+        const utilidadBruta = ingresosNetos - costoVenta.costo_total;
+        const gastosPorCategoria = gastosRes.rows.map(r => ({ categoria: r.categoria, total: parseFloat(r.total) }));
+        const gastosOperativosTotal = gastosPorCategoria.reduce((sum, g) => sum + g.total, 0);
+        const utilidadNeta = utilidadBruta - gastosOperativosTotal;
+
+        res.status(200).json({
+            fechaInicio, fechaFin,
+            ventas_brutas: ventasBrutas,
+            comisiones,
+            ingresos_netos: ingresosNetos,
+            costo_venta: costoVenta.costo_total,
+            utilidad_bruta: utilidadBruta,
+            margen_bruto_pct: ingresosNetos > 0 ? (utilidadBruta / ingresosNetos) * 100 : 0,
+            gastos_por_categoria: gastosPorCategoria,
+            gastos_operativos_total: gastosOperativosTotal,
+            utilidad_neta: utilidadNeta,
+            margen_neto_pct: ingresosNetos > 0 ? (utilidadNeta / ingresosNetos) * 100 : 0,
+            insumos_sin_costo: costoVenta.insumos_sin_costo
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Estado de resultados agrupado por mes, para ver la tendencia de rentabilidad en vez de un
+// periodo aislado. Cada fuente (ventas, COGS, gastos) se agrega por separado agrupando por mes
+// y luego se combinan en JS por clave 'mes' (más simple y robusto que un FULL OUTER JOIN a 3 bandas).
+app.get('/api/reportes/estado-resultados-mensual', requireAdmin, async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'Selecciona fecha de inicio y fecha fin.' });
+    try {
+        const [ventasRes, costoRes, sinCostoRes, gastosRes] = await Promise.all([
+            pool.query(`SELECT date_trunc('month', (fecha_creacion AT TIME ZONE 'America/Hermosillo'))::date::text AS mes,
+                    COALESCE(SUM(total), 0) AS ventas_brutas, COALESCE(SUM(comision), 0) AS comisiones
+                FROM Pedidos WHERE estado = 'Entregado' AND eliminado = FALSE
+                AND (fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+                GROUP BY mes`, [fechaInicio, fechaFin]),
+            pool.query(`SELECT date_trunc('month', (p.fecha_creacion AT TIME ZONE 'America/Hermosillo'))::date::text AS mes,
+                    SUM(ri.cantidad_necesaria * pi.cantidad * i.costo_promedio) AS costo_venta
+                FROM pedido_items pi
+                JOIN pedidos p ON pi.pedido_id = p.id
+                JOIN receta_insumo ri ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+                JOIN insumos i ON ri.insumo_id = i.id
+                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+                GROUP BY mes`, [fechaInicio, fechaFin]),
+            pool.query(`SELECT DISTINCT i.nombre FROM pedido_items pi
+                JOIN pedidos p ON pi.pedido_id = p.id
+                JOIN receta_insumo ri ON ri.receta_id = (SELECT receta_id FROM menu_productos WHERE id = pi.menu_producto_id)
+                JOIN insumos i ON ri.insumo_id = i.id
+                WHERE p.estado = 'Entregado' AND p.eliminado = FALSE
+                AND (p.fecha_creacion AT TIME ZONE 'America/Hermosillo')::date BETWEEN $1 AND $2
+                AND COALESCE(i.costo_promedio, 0) <= 0`, [fechaInicio, fechaFin]),
+            pool.query(`SELECT date_trunc('month', fecha_gasto)::date::text AS mes, SUM(monto) AS gastos_operativos
+                FROM gastos WHERE fecha_gasto BETWEEN $1 AND $2 GROUP BY mes`, [fechaInicio, fechaFin])
+        ]);
+
+        const mapa = {};
+        const getMes = (m) => (mapa[m] = mapa[m] || { mes: m, ventas_brutas: 0, comisiones: 0, costo_venta: 0, gastos_operativos: 0 });
+        ventasRes.rows.forEach(r => { const m = getMes(r.mes); m.ventas_brutas = parseFloat(r.ventas_brutas); m.comisiones = parseFloat(r.comisiones); });
+        costoRes.rows.forEach(r => { getMes(r.mes).costo_venta = parseFloat(r.costo_venta || 0); });
+        gastosRes.rows.forEach(r => { getMes(r.mes).gastos_operativos = parseFloat(r.gastos_operativos || 0); });
+
+        const meses = Object.values(mapa).sort((a, b) => a.mes.localeCompare(b.mes)).map(m => {
+            const ingresosNetos = m.ventas_brutas - m.comisiones;
+            const utilidadBruta = ingresosNetos - m.costo_venta;
+            const utilidadNeta = utilidadBruta - m.gastos_operativos;
+            return {
+                ...m,
+                ingresos_netos: ingresosNetos,
+                utilidad_bruta: utilidadBruta,
+                utilidad_neta: utilidadNeta,
+                margen_neto_pct: ingresosNetos > 0 ? (utilidadNeta / ingresosNetos) * 100 : 0
+            };
+        });
+
+        res.status(200).json({ meses, insumos_sin_costo: sinCostoRes.rows.map(r => r.nombre) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ======================================================================
